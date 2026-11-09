@@ -78,6 +78,10 @@
   .wi .fill { height: 100%; background: var(--pred); }
   .wi tr.sel td { color: var(--pred); font-weight: 700; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .sched { display: inline-flex; align-items: center; gap: 0; font-size: 12px; color: var(--muted); font-weight: 700; }
+  .sched button { margin-left: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .sched button + button { margin-left: 4px; }
+  .sched button.on { background: var(--ouroboros); color: #0d0f12; border-color: var(--ouroboros); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -87,6 +91,10 @@
     <h1><b>Ouroboros</b> Live — On-device vs Naive offload vs Ouroboros</h1>
     <span class="pill"><span class="dot" id="dot"></span><span id="connText">연결 중…</span></span>
     <span class="pill" id="gpuPill">GPU —</span>
+    <span class="sched" title="서버 GPU를 naive/Ouroboros 요청이 나눠 쓰는 방식. 데모 중 바로 전환 가능">
+      GPU 스케줄링
+      <button data-pol="fifo" id="polFifo">FIFO</button><button data-pol="fair" id="polFair">Fair-share</button>
+    </span>
     <span class="spacer"></span>
     <button id="resetBtn" title="대시보드 기록만 초기화 (앱/서버 동작에는 영향 없음)">기록 초기화</button>
   </header>
@@ -110,7 +118,9 @@
       <div class="scroll" style="margin-top:10px">
         <table id="cmpTable"></table>
       </div>
-      <div class="note">GPU 점유 = 그 방식의 ViT 연산이 GPU를 잡고 있던 시간 비율. GPU 대기 = 다른 방식의 요청이 GPU를 쓰는 동안 기다린 시간. 각 방식 최대 1대, 서버 측 CPU 전처리(디코드·정합·dirty map)는 병렬로 처리.</div>
+      <div class="note">GPU 점유 = 그 방식의 ViT 연산이 GPU를 잡고 있던 시간 비율. GPU 대기 = 다른 방식의 요청이 GPU를 쓰는 동안 기다린 시간. 각 방식 최대 1대, 서버 측 CPU 전처리(디코드·정합·dirty map)는 병렬로 처리.<br>
+        <b>FIFO</b>: 먼저 온 요청부터. 두 기기가 번갈아 GPU를 잡아 둘 다 같은 FPS가 되고, Ouroboros가 아낀 GPU 시간은 naive가 가져감.
+        <b>Fair-share</b>: GPU를 덜 쓴 방식에 우선권. 그 방식의 다음 요청이 곧 올 예정이면 GPU를 잠깐 비워 두고 기다림(양보 대기).</div>
     </div>
   </div>
 
@@ -184,6 +194,8 @@ function connect() {
   es.addEventListener("reset", () => { hist = []; dirty = true; });
 }
 $("resetBtn").onclick = () => fetch("v1/dashboard/reset", { method: "POST" });
+for (const b of document.querySelectorAll(".sched button"))
+  b.onclick = () => fetch("v1/sched?policy=" + b.dataset.pol, { method: "POST" });
 setInterval(() => { dirty = true; }, 1000);   // keep "N초 전" / online state fresh
 
 const imgV = {};
@@ -196,6 +208,8 @@ function render() {
   renderShare();
   renderPred();
   $("gpuPill").textContent = server ? `GPU 사용률 ${fmt(100 * server.gpu_util)}%` : "GPU —";
+  const pol = server?.sched;
+  $("polFifo").classList.toggle("on", pol === "fifo"); $("polFair").classList.toggle("on", pol === "fair");
 }
 
 function renderLane(k, now) {
@@ -253,6 +267,7 @@ function renderShare() {
       <span style="color:${r.m.color};font-weight:700">${r.m.label}</span>
       <div class="track"><div class="fill" style="width:${100 * (r.share || 0)}%;background:${r.m.color}"></div></div>
       <span class="num">${r.share == null ? "—" : fmt(100 * r.share) + "%"}</span></div>`).join("")
+    + (server && server.sched === "fair" ? `<div class="share"><span class="muted">양보 대기</span><div class="track"><div class="fill" style="width:${100 * (server.held_frac || 0)}%;background:#8d6e63"></div></div><span class="num">${fmt(100 * (server.held_frac || 0))}%</span></div>` : "")
     + `<div class="share"><span class="muted">유휴</span><div class="track"><div class="fill" style="width:${server ? 100 * Math.max(0, 1 - server.gpu_util) : 0}%;background:#3a4350"></div></div><span class="num">${server ? fmt(100 * Math.max(0, 1 - server.gpu_util)) + "%" : "—"}</span></div>`;
   $("cmpTable").innerHTML = `<tr><th></th><th>e2e (중앙값)</th><th>FPS</th><th>GPU/frame</th><th>GPU 대기</th><th>재연산 패치</th></tr>` +
     rows.map(r => `<tr><td style="color:${r.m.color};font-weight:700">${r.m.label}</td>

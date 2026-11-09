@@ -71,11 +71,27 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
   GPU share 30% / 70% (util 100%); prediction MAE 6.0 ms, 97% within ±10%, 99% within ±20%, GPU-wait MAE 5 ms.
 - App: mirror commit/reset moved to the mirror thread and the camera released as soon as the result is in,
   cutting per-frame dead time outside e2e from ~60 ms to ~6–9 ms.
-- **FIFO GPU sharing caveat:** with two always-ready clients the serialized GPU simply alternates
-  naive (152 ms) ↔ Ouroboros (60 ms), so *both* run at ≈1/(152+60 ms) ≈ 4.6 FPS — the GPU time Ouroboros
-  saves is donated to the naive phone. Ouroboros's win then shows up as GPU share (30% vs 70%) and
-  capacity, not as its own FPS. A fair-share scheduler (e.g. least-GPU-time-used first) would let
-  Ouroboros keep its advantage; not implemented — a demo-story decision for the user.
+- **GPU sharing policy, switchable live** (dashboard header buttons, `POST /v1/sched?policy=fifo|fair`,
+  or `--sched`). Measured with the Pixel on Ouroboros+prediction, sim naive (--net-ms 15), sim on-device:
+
+  | | FIFO | Fair-share |
+  |---|---|---|
+  | Ouroboros (Pixel) | 202 ms / 4.7 FPS | **132 ms / 6.1 FPS**, GPU wait median 0 |
+  | Naive (sim) | 204 ms / 4.7 FPS | 444 ms / 2.3 FPS |
+  | GPU share naive/ouro | 73% / 28% | 36% / 36% (+ ~30% anticipatory idle) |
+  | Prediction MAE (±10% / ±20%) | 9.5 ms (94% / 99%) | 16.8 ms (67% / 89%) |
+  | Patch count exact | 273/273 | 356/356 |
+
+  FIFO: two always-ready clients just alternate on the GPU, so both get ≈1/(152+53 ms) and the GPU time
+  Ouroboros saves is donated to naive. Fair: per-mode virtual GPU time, *anticipatory* — a plain
+  work-conserving priority does nothing here (the light tenant is always in its network gap when the GPU
+  frees), so the GPU is held idle briefly (≤150 ms, slack = 2×jitter of that tenant's request cycle) for a
+  mode that is under its share. Lag capped at 300 ms of GPU time and reset on policy switch (otherwise
+  credit banked under FIFO starved naive for seconds). Costs ~30% GPU idle.
+- Phone predictor replays the server's scheduler: `/v1/gpu` returns, per other tenant, its running/queued
+  job, its next expected arrival, and whether it would be served first (`ahead`, `ahead_next` = priority
+  after its running job is charged).
+- LMEDS RNG is seeded identically on both sides before registration (`REG_RNG_SEED`).
 - Dashboard 3-column desktop layout verified in headless Chromium (no console errors).
 
 ## Findings worth knowing
@@ -91,6 +107,5 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 ## Open / next
 - `server/run_demo.sh` (tmux) is written but its first launch from the Claude session was blocked by the
   permission classifier (persistent externally reachable service) — run it yourself or allow it.
-- GPU scheduling policy under contention (FIFO vs fair-share), see the MIG section.
 - Only one physical phone tested; naive/on-device lanes were exercised with sim_device.py.
 - Possible: send the phone's affine to skip server ORB (~10 ms) when prediction is on.

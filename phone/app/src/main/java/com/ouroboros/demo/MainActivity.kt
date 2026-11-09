@@ -434,7 +434,7 @@ class MainActivity : AppCompatActivity() {
             rec.put("pred", J()
                 .put("est", pend.est.totalMs).put("ready_at", pend.readyAtMs).put("mirror_ms", pend.pred.ms)
                 .put("n_pred", pend.pred.nDirty).put("refresh_pred", pend.pred.refresh)
-                .put("gpu_others", pend.probe?.othersMs ?: Double.NaN).put("probe_rtt", pend.probe?.rttMs ?: Double.NaN)
+                .put("gpu_others", pend.probe?.busyRemainingMs ?: Double.NaN).put("sched", pend.probe?.sched).put("probe_rtt", pend.probe?.rttMs ?: Double.NaN)
                 .put("gpu_wait_pred", pend.est.gpuWaitMs)
                 .put("parts", J().put("encode", pend.est.encodeMs).put("network", pend.est.networkMs)
                     .put("server_overhead", pend.est.serverOverheadMs).put("compute", pend.est.computeMs)

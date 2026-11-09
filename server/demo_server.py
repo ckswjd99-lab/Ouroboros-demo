@@ -69,6 +69,7 @@ PAD_COLOR = [0, 0, 0]
 RESULT_THRES = 0.5
 MAX_DIM = int(min(INPUT_SIZE) * 0.8)    # 819, same convention as webrtc_server.py
 MODES = ("naive", "ouroboros", "ondevice")
+REG_RNG_SEED = 0x0B0B   # must match OuroborosMirror.REG_RNG_SEED
 
 
 model = None
@@ -76,7 +77,145 @@ device = "cuda"
 gop = 20
 registration_mode = "rigid"
 port_mode = {}                       # local port -> mode
-gpu_lock = threading.Lock()          # the one shared resource every mode contends for
+
+
+class GpuScheduler:
+    """The one shared resource every mode contends for: a non-preemptive, work-conserving
+    GPU queue with a switchable policy.
+
+      fifo  first come, first served. Two always-ready phones then simply alternate, so
+            both run at 1/(sum of their job times) -- GPU time Ouroboros saves goes to the other.
+      fair  serve the mode that has used the least GPU time so far (per-mode virtual time =
+            cumulative GPU ms; a mode returning from idle is caught up to the busy modes'
+            minimum so it cannot bank credit). Plain work-conserving priority is not enough
+            with stop-and-wait phones: the light tenant is always in its network/encode gap
+            when the GPU frees, so the heavy one grabs it every time. So the scheduler is
+            *anticipatory*: if a mode that is under its share is due back within MAX_HOLD_MS
+            (from its measured request cycle), the GPU is held idle for it briefly.
+    """
+    POLICIES = ("fifo", "fair")
+    MAX_HOLD_MS = 150.0
+    MAX_LAG_MS = 300.0     # no mode may fall more than this much GPU time behind: no banked credit
+
+    def __init__(self, policy="fifo"):
+        self.policy = policy
+        self.cv = threading.Condition()
+        self.busy = False
+        self.seq = 0
+        self.waiting = []                 # [seq, mode]
+        self.vtime = {}                   # mode -> GPU ms consumed (virtual time)
+        self.last_active = {}
+        self.last_release = {}            # mode -> wall s
+        self.gap = {}                     # mode -> EWMA s from its release to its next acquire
+        self.gap_dev = {}                 # mode -> EWMA |deviation| of that gap (Wi-Fi jitter)
+        self.held_ms = 0.0                # GPU idle while a job was waiting (anticipatory hold)
+        self._acct_t = time.time()
+
+    def _catch_up(self, mode, now):
+        others = [v for m, v in self.vtime.items() if m != mode and now - self.last_active.get(m, 0) < 2.0]
+        if others:
+            self.vtime[mode] = max(self.vtime.get(mode, 0.0), min(others))
+        else:
+            self.vtime.setdefault(mode, 0.0)
+
+    def _pick(self):
+        if not self.waiting:
+            return None
+        if self.policy == "fair":
+            return min(self.waiting, key=lambda w: (self.vtime.get(w[1], 0.0), w[0]))
+        return min(self.waiting, key=lambda w: w[0])
+
+    def _hold_for(self, mode, now):
+        """Seconds to keep the GPU idle for a cheaper tenant that is about to come back."""
+        if self.policy != "fair":
+            return 0.0
+        waiting_modes = {w[1] for w in self.waiting}
+        best = 0.0
+        for m, rel in self.last_release.items():
+            if m == mode or m in waiting_modes or m not in self.gap:
+                continue
+            if self.vtime.get(m, 0.0) >= self.vtime.get(mode, 0.0):
+                continue                                   # not under its share
+            due = rel + self.gap[m]
+            slack = self.slack(m)
+            if now - rel > 2.0 or now > due + slack:
+                continue                                   # quiet, or overdue: stop waiting for it
+            if due - now <= self.MAX_HOLD_MS / 1000:
+                best = max(best, due + slack - now)
+        return best
+
+    def _account(self):
+        """Call under cv at every state change: accrue time the GPU sat idle with a job waiting."""
+        now = time.time()
+        if not self.busy and self.waiting:
+            self.held_ms += (now - self._acct_t) * 1000
+        self._acct_t = now
+
+    def slack(self, mode):
+        """How long past its expected arrival a tenant is still waited for: 2x its gap jitter."""
+        return min(0.050, max(0.010, 2 * self.gap_dev.get(mode, 0.005)))
+
+    def acquire(self, mode):
+        with self.cv:
+            now = time.time()
+            if now - self.last_active.get(mode, 0) > 2.0:
+                self._catch_up(mode, now)
+            if mode in self.last_release and now - self.last_release[mode] < 2.0:
+                g = now - self.last_release[mode]
+                if mode not in self.gap:
+                    self.gap[mode], self.gap_dev[mode] = g, 0.005
+                else:
+                    self.gap_dev[mode] += 0.2 * (abs(g - self.gap[mode]) - self.gap_dev[mode])
+                    self.gap[mode] += 0.3 * (g - self.gap[mode])
+            self.last_active[mode] = now
+            self.seq += 1
+            me = [self.seq, mode]
+            self._account()
+            self.waiting.append(me)
+            while True:
+                if self.busy or self._pick() is not me:
+                    self.cv.wait(); continue
+                hold = self._hold_for(mode, time.time())
+                if hold <= 0:
+                    break
+                self.cv.wait(hold)
+            self._account()
+            self.waiting.remove(me)
+            self.busy = True
+
+    def release(self, mode, gpu_ms):
+        with self.cv:
+            self._account()
+            self.vtime[mode] = self.vtime.get(mode, 0.0) + gpu_ms
+            self.last_active[mode] = self.last_release[mode] = time.time()
+            top = max(self.vtime.values())
+            for m in self.vtime:                      # bounded fairness window
+                self.vtime[m] = max(self.vtime[m], top - self.MAX_LAG_MS)
+            self.busy = False
+            self.cv.notify_all()
+
+    def ahead_of(self, other, mode, other_extra_ms=0.0):
+        """Would a waiting `other` job be served before a waiting `mode` job?
+        other_extra_ms: GPU time `other` will have added by then (its job running now)."""
+        if self.policy == "fifo":
+            return True                   # it got there first
+        with self.cv:
+            vo = self.vtime.get(other, 0.0) + other_extra_ms
+            vm = self.vtime.get(mode, 0.0)
+            if time.time() - self.last_active.get(mode, 0) > 2.0:
+                act = [v for m, v in self.vtime.items() if m != mode]
+                vm = max(vm, min(act)) if act else vm
+        return vo <= vm
+
+    def set_policy(self, policy):
+        with self.cv:
+            self.policy = policy
+            top = max(self.vtime.values(), default=0.0)
+            self.vtime = {m: top for m in self.vtime}   # start the new policy from a clean slate
+            self.cv.notify_all()
+
+
+gpu_sched = GpuScheduler()
 
 
 class Session:
@@ -185,7 +324,8 @@ class GpuState:
             waiting = list(self.waiting.values())
             last_end = dict(self.last_end); gap = dict(self.gap); last_n = dict(self.last_n)
         rem = max(0.0, cur[1] + cur[2] - now) if cur and cur[0] != mode else 0.0
-        q = sum(e for m, e in waiting if m != mode)
+        ahead = {m: gpu_sched.ahead_of(m, mode) for m in ("naive", "ouroboros") if m != mode}
+        q = sum(e for m, e in waiting if m != mode and ahead.get(m, True))
         tenants = []
         for m in ("naive", "ouroboros"):
             if m == mode or m not in last_end and not (cur and cur[0] == m):
@@ -196,14 +336,18 @@ class GpuState:
             g = gap.get(m)
             if cur and cur[0] == m:
                 r = max(0.0, cur[1] + cur[2] - now)
-                tenants.append({"mode": m, "state": "running", "remaining": r, "dur": dur,
+                # its *next* job competes with its virtual time after this one has been charged
+                tenants.append({"mode": m, "state": "running", "remaining": r, "dur": dur, "ahead": ahead[m],
+                                "ahead_next": gpu_sched.ahead_of(m, mode, other_extra_ms=cur[2]),
                                 "next_in": None if g is None else r + g})
             elif any(wm == m for wm, _ in waiting):
-                tenants.append({"mode": m, "state": "queued", "remaining": 0.0, "dur": dur, "next_in": None})
+                tenants.append({"mode": m, "state": "queued", "remaining": 0.0, "dur": dur, "ahead": ahead[m],
+                                "ahead_next": ahead[m], "next_in": None})
             else:
-                tenants.append({"mode": m, "state": "idle", "remaining": 0.0, "dur": dur,
+                tenants.append({"mode": m, "state": "idle", "remaining": 0.0, "dur": dur, "ahead": ahead[m],
+                                "ahead_next": ahead[m],
                                 "next_in": None if g is None else max(0.0, last_end[m] + g - now)})
-        return {"t": now, "busy_remaining": rem, "queued": q, "others": rem + q,
+        return {"t": now, "busy_remaining": rem, "queued": q, "others": rem + q, "sched": gpu_sched.policy,
                 "busy_mode": cur[0] if cur else None, "tenants": tenants}
 
 
@@ -268,6 +412,10 @@ def process(body, mode, thres, reset):
 
         if not refresh:
             try:
+                # LMEDS samples from OpenCV's thread-local RNG; seed it so the result does not
+                # depend on which worker thread got the request -- and so the phone's mirror,
+                # seeded identically, reproduces it bit-for-bit
+                cv2.setRNGSeed(REG_RNG_SEED)
                 affine = estimate_affine_in_padded_anchor_fast(s.anchor_image, frame_bgr, mode=registration_mode)
             except cv2.error:
                 # too few ORB keypoints/matches (dark or textureless frame): the upstream
@@ -299,7 +447,8 @@ def process(body, mode, thres, reset):
         token = object(); expected = gpu_state.expect(mode, n_dirty)
         gpu_state.queued(token, mode, expected)
         t_wait = time.perf_counter()
-        with gpu_lock:
+        gpu_sched.acquire(mode)
+        try:
             gpu_state.started(token, mode, expected)
             t_gpu = time.perf_counter()
             with torch.no_grad():
@@ -315,6 +464,8 @@ def process(body, mode, thres, reset):
             _sync()
             t_gpu_end = time.perf_counter()
             gpu_state.finished(mode, n_dirty, (t_gpu_end - t_gpu) * 1000)
+        finally:
+            gpu_sched.release(mode, (time.perf_counter() - t_gpu) * 1000 if "t_gpu" in locals() else 0.0)
         tm["gpu_wait"] = (t_gpu - t_wait) * 1000
         tm["model"] = (t_gpu_end - t_gpu) * 1000
         t = time.perf_counter()
@@ -383,6 +534,18 @@ async def infer(request):
           f"{'R' if resp['refresh'] else ' '} compute={tmg['compute']:6.1f} gpu={tmg['model']:5.1f} "
           f"wait={tmg['gpu_wait']:5.1f} reg={tmg['register']:4.1f}", flush=True)
     return web.json_response(resp)
+
+
+async def sched_policy(request):
+    """GET: current GPU scheduling policy.  POST ?policy=fifo|fair: switch it live."""
+    if request.method == "POST":
+        pol = request.query.get("policy", "")
+        if pol not in GpuScheduler.POLICIES:
+            return web.json_response({"error": f"policy must be one of {GpuScheduler.POLICIES}"}, status=400)
+        gpu_sched.set_policy(pol)
+        print(f"[sched] policy -> {pol}", flush=True)
+        _broadcast("server", {**gpu_stats.snapshot(), "now": time.time() * 1000, "sched": pol})
+    return web.json_response({"sched": gpu_sched.policy})
 
 
 async def gpu_probe(request):
@@ -467,10 +630,13 @@ async def events(request):
 
 async def server_stats_loop(app):
     async def loop():
+        prev_held = gpu_sched.held_ms
         while True:
             await asyncio.sleep(1.0)
+            held, prev_held = gpu_sched.held_ms - prev_held, gpu_sched.held_ms
             if dash_clients:
-                snap = gpu_stats.snapshot(); snap["now"] = time.time() * 1000
+                snap = gpu_stats.snapshot(); snap["now"] = time.time() * 1000; snap["sched"] = gpu_sched.policy
+                snap["held_frac"] = min(1.0, held / 1000)   # anticipatory idle in the last second
                 _broadcast("server", snap)
     task = asyncio.create_task(loop())
     yield
@@ -534,8 +700,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--gop", type=int, default=20)
     ap.add_argument("--registration", default="rigid", choices=["rigid", "affine"])
+    ap.add_argument("--sched", default="fifo", choices=list(GpuScheduler.POLICIES),
+                    help="GPU sharing between modes (switchable live from the dashboard / POST /v1/sched)")
     args = ap.parse_args()
     device, gop, registration_mode = args.device, args.gop, args.registration
+    gpu_sched.set_policy(args.sched)
     port_mode.update({args.dashboard_port: "dashboard", args.naive_port: "naive",
                       args.ouroboros_port: "ouroboros", args.ondevice_port: "ondevice"})
 
@@ -550,6 +719,8 @@ def main():
     app.router.add_post("/v1/infer", infer)
     app.router.add_get("/v1/time", time_probe)
     app.router.add_get("/v1/gpu", gpu_probe)
+    app.router.add_get("/v1/sched", sched_policy)
+    app.router.add_post("/v1/sched", sched_policy)
     app.router.add_post("/v1/reset", reset)
     app.router.add_get("/v1/model/{name}", model_file)
     app.router.add_post("/v1/report", report)
@@ -565,7 +736,7 @@ def main():
         await runner.setup()
         for port in port_mode:
             await web.TCPSite(runner, args.host, port).start()
-        print(f"ready: Ouroboros={OUROBOROS_ROOT} gop={gop} reg={registration_mode} | "
+        print(f"ready: Ouroboros={OUROBOROS_ROOT} gop={gop} reg={registration_mode} sched={gpu_sched.policy} | "
               + " ".join(f"{m}:{p}" for p, m in port_mode.items()), flush=True)
         await asyncio.Event().wait()
 

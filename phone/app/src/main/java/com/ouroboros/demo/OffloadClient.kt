@@ -25,19 +25,40 @@ class OffloadClient(base: String) {
     }
 
     /** Another phone's job stream on the shared GPU, as the server sees it right now. */
-    data class Tenant(val mode: String, val state: String, val remainingMs: Double, val durMs: Double, val nextInMs: Double?)
-    data class GpuProbe(val othersMs: Double, val rttMs: Double, val busyMode: String?, val tenants: List<Tenant>) {
+    data class Tenant(val mode: String, val state: String, val remainingMs: Double, val durMs: Double,
+                      val nextInMs: Double?, val ahead: Boolean, val aheadNext: Boolean)
+    data class GpuProbe(val busyRemainingMs: Double, val rttMs: Double, val busyMode: String?,
+                        val sched: String, val tenants: List<Tenant>) {
         /**
          * Expected GPU wait for a request that reaches the server's GPU queue [arriveInMs]
-         * after the probe was answered: whatever is running/queued now, plus any other
-         * tenant whose next job is due before we get there (FIFO).
+         * after the probe was answered. Replays the server's scheduler (demo_server.GpuScheduler)
+         * over the next few jobs: the one running now, anything queued, and each other tenant's
+         * next job if it is due before we get there.
+         *  - an idle GPU starts whatever arrives (work-conserving) ...
+         *  - ... except under "fair", where it is held for a cheaper tenant (us, when the other
+         *    is not `ahead`) due within MAX_HOLD_MS
+         *  - when both are waiting, `ahead` decides (always true under FIFO: it got there first)
          */
         fun simulateWait(arriveInMs: Double): Double {
-            var free = othersMs
-            val arrivals = tenants.mapNotNull { t -> t.nextInMs?.let { it to t.durMs } }.sortedBy { it.first }
-            for ((at, dur) in arrivals) if (at < arriveInMs) free = maxOf(free, at) + dur
+            var free = busyRemainingMs
+            val arrivals = tenants.flatMap { t ->
+                listOfNotNull(if (t.state == "queued") Triple(0.0, t.durMs, t.ahead) else null,
+                              t.nextInMs?.let { Triple(it, t.durMs, t.aheadNext) })
+            }.sortedBy { it.first }
+            for ((at, dur, ahead) in arrivals) {
+                if (at >= arriveInMs) continue
+                val heldForUs = sched == "fair" && !ahead && arriveInMs - at <= MAX_HOLD_MS
+                free = when {
+                    heldForUs -> free                       // server keeps the GPU for us
+                    at >= free -> at + dur                  // GPU idle when it arrives: it starts
+                    free <= arriveInMs -> free + dur        // GPU frees before we arrive: it runs
+                    ahead -> free + dur                     // both waiting, it wins
+                    else -> free                            // both waiting, we win
+                }
+            }
             return maxOf(0.0, free - arriveInMs)
         }
+        companion object { const val MAX_HOLD_MS = 150.0 }   // demo_server.GpuScheduler.MAX_HOLD_MS
     }
 
     /** What the server's GPU still owes *other* phones right now (GET /v1/gpu). */
@@ -49,9 +70,11 @@ class OffloadClient(base: String) {
         val tenants = (0 until (ts?.length() ?: 0)).map { i ->
             val t = ts!!.getJSONObject(i)
             Tenant(t.getString("mode"), t.getString("state"), t.optDouble("remaining", 0.0), t.optDouble("dur", 0.0),
-                if (t.isNull("next_in")) null else t.getDouble("next_in"))
+                if (t.isNull("next_in")) null else t.getDouble("next_in"), t.optBoolean("ahead", true),
+                t.optBoolean("ahead_next", t.optBoolean("ahead", true)))
         }
-        return GpuProbe(j.getDouble("others"), rtt, j.optString("busy_mode").takeIf { it.isNotEmpty() && it != "null" }, tenants)
+        return GpuProbe(j.optDouble("busy_remaining", 0.0), rtt,
+            j.optString("busy_mode").takeIf { it.isNotEmpty() && it != "null" }, j.optString("sched", "fifo"), tenants)
     }
 
     data class Response(

@@ -64,6 +64,7 @@ class OuroborosMirror(var gop: Int = 20) {
         const val BLOCK = 16
         const val GRID = CANVAS / BLOCK
         const val N_PATCHES = GRID * GRID
+        const val REG_RNG_SEED = 0x0B0B   // must match demo_server.REG_RNG_SEED
         private const val MAX_DIM = (CANVAS * 0.8).toInt()   // 819
     }
 
@@ -189,6 +190,7 @@ class OuroborosMirror(var gop: Int = 20) {
         val src = MatOfPoint2f(*matches.map { k1[it.queryIdx].pt }.toTypedArray())
         val dst = MatOfPoint2f(*matches.map { k2[it.trainIdx].pt }.toTypedArray())
         val inl = Mat()
+        Core.setRNGSeed(REG_RNG_SEED)   // same seed as the server: LMEDS draws from this RNG
         val m = Geometry.estimateAffinePartial2D(src, dst, inl, Geometry.LMEDS)
         if (m == null || m.empty()) return null
         val a00 = m.get(0, 0)[0]; val a10 = m.get(1, 0)[0]
