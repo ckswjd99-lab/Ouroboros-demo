@@ -1,4 +1,4 @@
-# Phone demo — status (2026-11-09)
+# Phone demo — status (2026-11-10)
 
 Three detection paths on a phone camera, all running the *same* ViTDet-B, plus a live dashboard.
 Main scenario: three phones at once, one per mode, sharing one GPU server.
@@ -27,9 +27,13 @@ Main scenario: three phones at once, one per mode, sharing one GPU server.
   - `DashboardReporter.kt` — fire-and-forget per-frame report to the server.
 
 ## How to run
+GPU: this container may only use **MIG-bb8cda48-86b2-549c-84c2-32299742a69b** (3g.48gb, 60 SMs, 46.5 GiB).
+Always pass `CUDA_VISIBLE_DEVICES` explicitly to anything started in the background.
 ```bash
-# server (Ouroboros venv; Ouroboros checkout at ~/Ouroboros)
-cd server && ~/Ouroboros/.venv/bin/python demo_server.py
+# server, detached in tmux (survives the launching shell); pins the MIG; prints the URLs
+server/run_demo.sh            # restart = run again;  stop: server/run_demo.sh stop;  log: tmux attach -t ouroboros-demo
+# or in the foreground:
+cd server && CUDA_VISIBLE_DEVICES=MIG-bb8cda48-86b2-549c-84c2-32299742a69b ~/Ouroboros/.venv/bin/python demo_server.py
 # on-device model (434 MB, not in git):  ~/Ouroboros/.venv/bin/python tools/export_vitdet_onnx.py --out build/vitdet_b.onnx
 #   (needs onnx onnxruntime onnxscript in the venv)
 # app
@@ -59,6 +63,21 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 - Prediction: patch count exact 411/411; e2e MAE 14.8 ms, bias +0.3, 61% within ±10%, 86% within ±20%.
   Without the queue-aware GPU probe it was MAE 45 ms / 7% within ±10%.
 
+## On the MIG 3g.48gb slice (since 2026-11-10)
+- ViT: full 152 ms (was 85 on the whole GH200); partial ≈ 54 ms + 25 µs/patch (was 46 + 9) → Ouroboros's
+  relative saving is larger on the smaller slice.
+- Pixel alone, Ouroboros + prediction: e2e 116 ms, **8.0 FPS**, prediction MAE 8 ms, patches exact 310/310.
+- Three at once (Pixel Ouroboros, sim naive --net-ms 15, sim on-device): Ouroboros 162 ms / naive 209 ms e2e,
+  GPU share 30% / 70% (util 100%); prediction MAE 6.0 ms, 97% within ±10%, 99% within ±20%, GPU-wait MAE 5 ms.
+- App: mirror commit/reset moved to the mirror thread and the camera released as soon as the result is in,
+  cutting per-frame dead time outside e2e from ~60 ms to ~6–9 ms.
+- **FIFO GPU sharing caveat:** with two always-ready clients the serialized GPU simply alternates
+  naive (152 ms) ↔ Ouroboros (60 ms), so *both* run at ≈1/(152+60 ms) ≈ 4.6 FPS — the GPU time Ouroboros
+  saves is donated to the naive phone. Ouroboros's win then shows up as GPU share (30% vs 70%) and
+  capacity, not as its own FPS. A fair-share scheduler (e.g. least-GPU-time-used first) would let
+  Ouroboros keep its advantage; not implemented — a demo-story decision for the user.
+- Dashboard 3-column desktop layout verified in headless Chromium (no console errors).
+
 ## Findings worth knowing
 - The create_dirtiness_map chain (>thr → blur15 → resize 1/16 linear → >0) equals "max of blurred
   residual over the 16×16 patch > thr" (verified on 1800 cases) — the phone uses a 64×64 max-pool.
@@ -70,8 +89,8 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 - GH200: ViT ≈ 46 ms + 9 µs/patch, so threshold barely moves latency (fixed cost dominates).
 
 ## Open / next
-- Dashboard was verified on a phone browser (stacked layout); desktop 3-column layout not yet screenshot-checked
-  (headless Chromium was being installed when work stopped).
-- Server runs in the foreground of a session; for the demo, run it under tmux/systemd.
+- `server/run_demo.sh` (tmux) is written but its first launch from the Claude session was blocked by the
+  permission classifier (persistent externally reachable service) — run it yourself or allow it.
+- GPU scheduling policy under contention (FIFO vs fair-share), see the MIG section.
 - Only one physical phone tested; naive/on-device lanes were exercised with sim_device.py.
 - Possible: send the phone's affine to skip server ORB (~10 ms) when prediction is on.

@@ -324,7 +324,9 @@ class MainActivity : AppCompatActivity() {
 
         val wantPredict = m == Mode.OUROBOROS && predictOn
         val reset = resetNext; resetNext = false
-        if (reset) { mirror.reset(); mirrorInSync = wantPredict }
+        // mirror state is only ever touched on mirrorExec (single thread), so reset/commit
+        // stay ordered with the predictions without blocking this loop
+        if (reset) { mirrorExec.execute { mirror.reset() }; mirrorInSync = wantPredict }
 
         // Both run on their own threads while the upload is in flight: the mirror works out
         // how many patches the server will recompute, the probe asks how much GPU work other
@@ -357,6 +359,9 @@ class MainActivity : AppCompatActivity() {
         r.json.optInt("gop", 0).takeIf { it > 0 }?.let { mirror.gop = it }
 
         val pend = try { fut?.get() } catch (e: Exception) { Log.e(TAG, "mirror failed", e); mirrorInSync = false; null }
+        // The result is in hand: let the camera thread grab and convert the next frame while
+        // this one's bookkeeping (anchor update, stats, dashboard report) finishes.
+        busy.set(false)
         var affDiff = Double.NaN
         if (pend != null) {
             val sAff = r.json.optJSONArray("affine")?.let { arr ->
@@ -364,7 +369,8 @@ class MainActivity : AppCompatActivity() {
             val sShift = r.json.optJSONArray("shift")?.let { intArrayOf(it.getInt(0), it.getInt(1)) }
             val sDmap = r.json.optString("dmap", "").takeIf { it.isNotEmpty() && it != "null" }
                 ?.let { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }
-            mirror.commit(r.refresh, sAff, sShift, sDmap)
+            val refresh = r.refresh
+            mirrorExec.execute { mirror.commit(refresh, sAff, sShift, sDmap) }
             affDiff = if (sAff != null && pend.pred.affine != null)
                 sAff.indices.maxOf { kotlin.math.abs(sAff[it] - pend.pred.affine[it]) } else Double.NaN
             errStats.add(pend.est.totalMs, e2e, pend.pred.nDirty, r.nDirty)
