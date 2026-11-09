@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:background="#101010" android:fillViewport="true">
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="10dp">
+
+        <ImageView android:id="@+id/imgResult"
+            android:layout_width="match_parent" android:layout_height="380dp"
+            android:background="#000000" android:scaleType="fitCenter" />
+
+        <TextView android:id="@+id/txtStatus"
+            android:layout_width="match_parent" android:layout_height="58dp"
+            android:gravity="center_vertical" android:fallbackLineSpacing="false"
+            android:paddingTop="6dp" android:textColor="#FFFFFF" android:textSize="16sp"
+            android:textStyle="bold" android:text="대기 중"
+            android:maxLines="2" android:ellipsize="end" />
+
+        <com.ouroboros.demo.LatencyChartView android:id="@+id/chart"
+            android:layout_width="match_parent" android:layout_height="170dp"
+            android:layout_marginTop="6dp" />
+
+        <RadioGroup android:id="@+id/radioMode"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:layout_marginTop="6dp">
+            <RadioButton android:id="@+id/modeOnDevice" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="On-device" android:textColor="#FFFFFF" />
+            <RadioButton android:id="@+id/modeNaive" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="Naive offload" android:textColor="#FFFFFF" />
+            <RadioButton android:id="@+id/modeOuroboros" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="Ouroboros" android:textColor="#FFFFFF"
+                android:checked="true" />
+        </RadioGroup>
+
+        <LinearLayout android:id="@+id/rowThres"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <TextView android:id="@+id/txtThres" android:layout_width="150dp" android:layout_height="wrap_content"
+                android:textColor="#FFFFFF" android:text="threshold 20" />
+            <SeekBar android:id="@+id/seekThres" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:max="100" android:progress="20" />
+        </LinearLayout>
+
+        <CheckBox android:id="@+id/checkPredict"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#FFFFFF"
+            android:text="e2e latency 예측 (모바일에서 재연산 패치 수 병렬 계산)" />
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <EditText android:id="@+id/editServer" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:inputType="textUri" android:textColor="#FFFFFF"
+                android:hint="서버 host (포트는 모드별 자동)" android:text="147.46.66.242" />
+            <Button android:id="@+id/btnStart" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="시작" />
+        </LinearLayout>
+
+        <TextView android:id="@+id/txtStats"
+            android:layout_width="match_parent" android:layout_height="130dp"
+            android:fallbackLineSpacing="false"
+            android:fontFamily="monospace" android:textColor="#D0D0D0" android:textSize="12sp"
+            android:paddingTop="6dp" android:maxLines="7" android:ellipsize="end" />
+
+        <TextView android:id="@+id/txtPredict"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:fontFamily="monospace" android:textColor="#FFB74D" android:textSize="12sp"
+            android:paddingTop="6dp" />
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,576 @@
+"""
+demo_server.py -- inference + dashboard server for the phone demo (phone/).
+
+Main scenario: three phones at once, one per mode, all against this one GPU.
+
+  port 65433  NAIVE      POST /v1/infer  every frame padded to 1024x1024 and fully
+                                         inferred, independently of every other frame
+  port 65434  OUROBOROS  POST /v1/infer  ORB registration against the anchor canvas,
+                                         toroidal shift of anchor image + cached features,
+                                         dirtiness map (?thres=), partial recompute of
+                                         dirty 16x16 patches only, GOP refresh
+  port 65435  ON-DEVICE  (no inference)  the on-device phone fetches its ONNX model and
+                                         sends dashboard reports here
+  port 65432  DASHBOARD  GET /           live dashboard for any browser
+
+Every port serves the same routes (dashboard, reports, clock probe); the port a
+request arrives on decides which mode /v1/infer runs. Each mode has its own
+session state (one device per mode). CPU-side work (JPEG decode, ORB
+registration, dirtiness map, box mapping) runs in parallel per request; only
+the ViT forward pass is serialized on the GPU, and the time a request waits
+for the GPU is reported separately (timing.gpu_wait) -- that is what the
+other tenants cost it.
+
+Response: detections already mapped back into the *sent frame's* normalized
+coordinates, the number of recomputed patches, the recompute map itself
+(64x64 bits, so the phone's mirror can follow the server's anchor exactly),
+and a per-stage timing breakdown.
+
+Runs against an Ouroboros checkout (OUROBOROS_ROOT, else ../third_party/Ouroboros,
+../../Ouroboros or ~/Ouroboros) and its venv.
+"""
+
+import argparse
+import asyncio
+import base64
+import json
+import os
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+_root_candidates = [os.environ.get("OUROBOROS_ROOT"), HERE.parent / "third_party" / "Ouroboros",
+                    HERE.parent.parent / "Ouroboros", Path.home() / "Ouroboros"]
+OUROBOROS_ROOT = next(Path(p) for p in _root_candidates if p and (Path(p) / "offload" / "preprocessing.py").exists())
+OFFLOAD_DIR = OUROBOROS_ROOT / "offload"
+sys.path.insert(0, str(OFFLOAD_DIR))
+
+import torch  # noqa: E402
+from aiohttp import web  # noqa: E402
+
+sys.path.insert(0, str(HERE))
+from coco import COCO  # noqa: E402
+from preprocessing import (  # noqa: E402
+    shift_anchor_features, apply_affine_and_pad, get_padded_image,
+    estimate_affine_in_padded_anchor_fast, create_dirtiness_map,
+)
+
+INPUT_SIZE = (1024, 1024)
+BLOCK = 16
+GRID = INPUT_SIZE[0] // BLOCK          # 64
+N_PATCHES = GRID * GRID                 # 4096
+PAD_COLOR = [0, 0, 0]
+RESULT_THRES = 0.5
+MAX_DIM = int(min(INPUT_SIZE) * 0.8)    # 819, same convention as webrtc_server.py
+MODES = ("naive", "ouroboros", "ondevice")
+
+
+model = None
+device = "cuda"
+gop = 20
+registration_mode = "rigid"
+port_mode = {}                       # local port -> mode
+gpu_lock = threading.Lock()          # the one shared resource every mode contends for
+
+
+class Session:
+    def __init__(self):
+        self.anchor_image = None
+        self.anchor_features = None
+        self.frame_idx = 0
+        self.lock = threading.Lock()  # one device per mode, but never let two requests interleave
+
+
+sessions = {"naive": Session(), "ouroboros": Session()}
+
+
+class GpuStats:
+    """Sliding 5 s window of GPU occupancy / waits per mode, for the dashboard."""
+    WINDOW = 5.0
+
+    def __init__(self):
+        self.ev = deque()            # (t_end, mode, busy_ms, wait_ms, compute_ms)
+        self.lock = threading.Lock()
+
+    def add(self, mode, busy_ms, wait_ms, compute_ms):
+        with self.lock:
+            self.ev.append((time.time(), mode, busy_ms, wait_ms, compute_ms))
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            while self.ev and now - self.ev[0][0] > self.WINDOW:
+                self.ev.popleft()
+            ev = list(self.ev)
+        out = {}
+        for m in ("naive", "ouroboros"):
+            xs = [e for e in ev if e[1] == m]
+            out[m] = {
+                "rps": len(xs) / self.WINDOW,
+                "gpu_share": sum(e[2] for e in xs) / (self.WINDOW * 1000),
+                "gpu_ms": float(np.mean([e[2] for e in xs])) if xs else None,
+                "wait_ms": float(np.mean([e[3] for e in xs])) if xs else None,
+                "compute_ms": float(np.mean([e[4] for e in xs])) if xs else None,
+            }
+        out["gpu_util"] = sum(e[2] for e in ev) / (self.WINDOW * 1000)
+        return out
+
+
+gpu_stats = GpuStats()
+
+
+class GpuState:
+    """Who holds the GPU right now, who is queued, and when each other tenant is due back.
+
+    Exposed via GET /v1/gpu so a phone can fold the *other* tenants' GPU work into its
+    latency prediction -- the one input it cannot compute itself. Besides the job that
+    is running/queued now, it reports each tenant's request cycle (gap between the end of
+    one of its GPU jobs and the arrival of its next one), so the phone can also account
+    for a job that will grab the GPU before its own request gets there.
+    Expected ViT time per job: a per-mode least-squares line in n_dirty.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current = None              # (mode, t_start, expected_ms)
+        self.waiting = {}                # token -> (mode, expected_ms)
+        self.obs = {m: deque(maxlen=60) for m in ("naive", "ouroboros")}
+        self.last_end = {}               # mode -> wall ms
+        self.last_n = {}                 # mode -> n_dirty of its last job
+        self.gap = {}                    # mode -> EWMA ms from job end to its next arrival at the GPU queue
+
+    def expect(self, mode, n):
+        with self.lock:
+            xs = list(self.obs[mode])
+        if len(xs) < 3:
+            return 90.0
+        a = np.array(xs)
+        if a[:, 0].std() < 1:
+            return float(a[:, 1].mean())
+        b, c = np.polyfit(a[:, 0], a[:, 1], 1)
+        return float(max(5.0, b * n + c))
+
+    def queued(self, token, mode, expected):
+        now = time.time() * 1000
+        with self.lock:
+            self.waiting[token] = (mode, expected)
+            if mode in self.last_end:
+                g = now - self.last_end[mode]
+                if g < 5000:
+                    self.gap[mode] = g if mode not in self.gap else self.gap[mode] + 0.2 * (g - self.gap[mode])
+
+    def started(self, token, mode, expected):
+        with self.lock:
+            self.waiting.pop(token, None)
+            self.current = (mode, time.time() * 1000, expected)
+
+    def finished(self, mode, n, model_ms):
+        with self.lock:
+            self.current = None
+            self.obs[mode].append((n, model_ms))
+            self.last_end[mode] = time.time() * 1000
+            self.last_n[mode] = n
+
+    def others_ms(self, mode):
+        """GPU work owed to other modes as of now, plus when each is next due back."""
+        now = time.time() * 1000
+        with self.lock:
+            cur = self.current
+            waiting = list(self.waiting.values())
+            last_end = dict(self.last_end); gap = dict(self.gap); last_n = dict(self.last_n)
+        rem = max(0.0, cur[1] + cur[2] - now) if cur and cur[0] != mode else 0.0
+        q = sum(e for m, e in waiting if m != mode)
+        tenants = []
+        for m in ("naive", "ouroboros"):
+            if m == mode or m not in last_end and not (cur and cur[0] == m):
+                continue
+            if now - last_end.get(m, now) > 3000 and not (cur and cur[0] == m):
+                continue                                   # gone quiet: not a tenant right now
+            dur = self.expect(m, last_n.get(m, N_PATCHES))
+            g = gap.get(m)
+            if cur and cur[0] == m:
+                r = max(0.0, cur[1] + cur[2] - now)
+                tenants.append({"mode": m, "state": "running", "remaining": r, "dur": dur,
+                                "next_in": None if g is None else r + g})
+            elif any(wm == m for wm, _ in waiting):
+                tenants.append({"mode": m, "state": "queued", "remaining": 0.0, "dur": dur, "next_in": None})
+            else:
+                tenants.append({"mode": m, "state": "idle", "remaining": 0.0, "dur": dur,
+                                "next_in": None if g is None else max(0.0, last_end[m] + g - now)})
+        return {"t": now, "busy_remaining": rem, "queued": q, "others": rem + q,
+                "busy_mode": cur[0] if cur else None, "tenants": tenants}
+
+
+gpu_state = GpuState()
+
+
+def _sync():
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def _map_boxes_to_frame(boxes, frame_wh, scale, refresh, offset, affine):
+    """Canvas-space boxes -> normalized [0,1] boxes in the client's sent frame.
+
+    refresh: canvas = centre-padded resized frame (pure translation by offset).
+    otherwise: canvas = affine(resized frame), so invert the 2x3 affine and
+    take the axis-aligned hull of the 4 mapped corners (rigid registration
+    can rotate a box slightly).
+    """
+    W, H = frame_wh
+    out = []
+    if len(boxes) == 0:
+        return out
+    if refresh:
+        inv = np.array([[1, 0, -offset[0]], [0, 1, -offset[1]]], dtype=np.float64)
+    else:
+        A = np.vstack([affine, [0, 0, 1]]).astype(np.float64)
+        inv = np.linalg.inv(A)[:2]
+    for x0, y0, x1, y1 in boxes:
+        pts = np.array([[x0, y0, 1], [x1, y0, 1], [x0, y1, 1], [x1, y1, 1]], dtype=np.float64)
+        m = pts @ inv.T / scale
+        bx0, by0 = m[:, 0].min() / W, m[:, 1].min() / H
+        bx1, by1 = m[:, 0].max() / W, m[:, 1].max() / H
+        out.append([float(np.clip(v, 0, 1)) for v in (bx0, by0, bx1, by1)])
+    return out
+
+
+def process(body, mode, thres, reset):
+    """Whole request on a worker thread: CPU stages in parallel, GPU stage serialized."""
+    s = sessions[mode]
+    with s.lock:
+        if reset:
+            s.__init__()
+        tm = {}
+        t = time.perf_counter()
+        frame_bgr = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise ValueError(f"undecodable image ({len(body)} B)")
+        tm["decode"] = (time.perf_counter() - t) * 1000; t = time.perf_counter()
+
+        H0, W0 = frame_bgr.shape[:2]
+        scale = 1.0
+        if max(H0, W0) > MAX_DIM:
+            scale = MAX_DIM / max(H0, W0)
+            frame_bgr = cv2.resize(frame_bgr, (int(W0 * scale), int(H0 * scale)), interpolation=cv2.INTER_LINEAR)
+        h, w = frame_bgr.shape[:2]
+
+        refresh = mode == "naive" or s.anchor_image is None or s.frame_idx % gop == 0
+        affine, shift, dmap = None, (0, 0), None
+        reason = "naive" if mode == "naive" else ("first" if s.anchor_image is None else "gop")
+        tm["register"] = tm["dirty"] = 0.0
+
+        if not refresh:
+            try:
+                affine = estimate_affine_in_padded_anchor_fast(s.anchor_image, frame_bgr, mode=registration_mode)
+            except cv2.error:
+                # too few ORB keypoints/matches (dark or textureless frame): the upstream
+                # helper raises instead of returning None -- treat it as a failed registration.
+                affine = None
+            if affine is None:
+                refresh, reason = True, "reg_fail"
+            else:
+                target, shift, affine = apply_affine_and_pad(frame_bgr, affine, block_size=BLOCK, filling_color=PAD_COLOR)
+                tm["register"] = (time.perf_counter() - t) * 1000; t = time.perf_counter()
+                s.anchor_image = np.roll(s.anchor_image, shift=(-shift[0], -shift[1]), axis=(1, 0))
+                dmap = create_dirtiness_map(s.anchor_image, target, dirty_thres=thres)
+                if np.linalg.norm(affine[:2, :2]) < 0.95:
+                    refresh, reason = True, "scale"
+                tm["dirty"] = (time.perf_counter() - t) * 1000; t = time.perf_counter()
+
+        offset = ((INPUT_SIZE[1] - w) // 2, (INPUT_SIZE[0] - h) // 2)
+        if refresh:
+            target = get_padded_image(frame_bgr, INPUT_SIZE, filling_color=PAD_COLOR)
+            dmap = torch.ones(1, GRID, GRID, 1, device=device)
+            shift = (0, 0)
+        dmap_np = dmap[0, :, :, 0].cpu().numpy() > 0
+        n_dirty = int(dmap_np.sum())
+        # The phone's mirror advances its copy of the anchor with exactly this map
+        # (64x64 bits, 512 B), so it can never drift from the server's state.
+        dmap_bits = None if refresh else base64.b64encode(np.packbits(dmap_np).tobytes()).decode("ascii")
+
+        # ---- GPU: the only serialized stage ----
+        token = object(); expected = gpu_state.expect(mode, n_dirty)
+        gpu_state.queued(token, mode, expected)
+        t_wait = time.perf_counter()
+        with gpu_lock:
+            gpu_state.started(token, mode, expected)
+            t_gpu = time.perf_counter()
+            with torch.no_grad():
+                if s.anchor_features is not None and (shift[0] or shift[1]):
+                    s.anchor_features = shift_anchor_features(s.anchor_features, shift[0] // BLOCK, shift[1] // BLOCK)
+                if refresh:
+                    (boxes, labels, scores), cache = model.forward_contexted(target)
+                else:
+                    (boxes, labels, scores), cache = model.forward_contexted(
+                        target, anchor_features=s.anchor_features, dirtiness_map=dmap)
+                keep = scores > RESULT_THRES
+                boxes, labels, scores = boxes[keep], labels[keep], scores[keep]
+            _sync()
+            t_gpu_end = time.perf_counter()
+            gpu_state.finished(mode, n_dirty, (t_gpu_end - t_gpu) * 1000)
+        tm["gpu_wait"] = (t_gpu - t_wait) * 1000
+        tm["model"] = (t_gpu_end - t_gpu) * 1000
+        t = time.perf_counter()
+
+        if mode == "ouroboros":
+            s.anchor_features = cache
+            if s.anchor_image is None or refresh:
+                s.anchor_image = target
+            else:
+                # Same result as upstream's (d*target + (1-d)*anchor).astype(uint8) -- d is exactly
+                # 0/1 -- without float64 math over the whole 1024x1024x3 canvas (~8 ms -> <1 ms).
+                d = cv2.resize(dmap_np.astype(np.uint8), INPUT_SIZE, interpolation=cv2.INTER_NEAREST).astype(bool)
+                s.anchor_image = np.ascontiguousarray(s.anchor_image)
+                np.copyto(s.anchor_image, target, where=d[:, :, None])
+
+        nboxes = _map_boxes_to_frame(boxes.tolist(), (W0, H0), scale, refresh, offset, affine)
+        tm["post"] = (time.perf_counter() - t) * 1000
+        # what the phone's predictor models as "compute": everything except waiting for the GPU
+        tm["compute"] = sum(v for k, v in tm.items() if k != "gpu_wait")
+        gpu_stats.add(mode, tm["model"], tm["gpu_wait"], tm["compute"])
+
+        resp = {
+            "idx": s.frame_idx, "mode": mode, "refresh": bool(refresh), "refresh_reason": reason if refresh else None,
+            "thres": thres, "gop": gop, "n_dirty": n_dirty, "n_total": N_PATCHES,
+            "frame_wh": [W0, H0], "shift": [int(shift[0]), int(shift[1])],
+            "affine": affine.tolist() if affine is not None else None,
+            "boxes": nboxes, "scores": [float(x) for x in scores.tolist()],
+            "labels": [int(x) for x in labels.tolist()],
+            "names": [COCO[int(x)] if 0 <= int(x) < len(COCO) else str(int(x)) for x in labels.tolist()],
+            "timing": {k: round(v, 3) for k, v in tm.items()},
+            "dmap": dmap_bits,
+        }
+        s.frame_idx += 1
+        return resp
+
+
+def _request_mode(request):
+    sock = request.transport.get_extra_info("sockname") if request.transport else None
+    return port_mode.get(sock[1] if sock else None)
+
+
+async def infer(request):
+    t_recv = time.time() * 1000
+    body = await request.read()
+    t_body = time.time() * 1000
+    # the port decides; ?mode= only matters on the dashboard port (handy for test_client.py)
+    mode = _request_mode(request)
+    if mode in (None, "dashboard"):
+        mode = request.query.get("mode", "ouroboros")
+    if mode not in ("naive", "ouroboros"):
+        return web.json_response({"error": f"no inference on the {mode} port"}, status=400)
+    thres = int(request.query.get("thres", "20"))
+    reset = request.query.get("reset") == "1"
+    try:
+        resp = await asyncio.get_running_loop().run_in_executor(None, process, body, mode, thres, reset)
+    except Exception as e:  # keep serving; report to the phone
+        import traceback; traceback.print_exc()
+        sessions[mode].__init__()
+        return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=500)
+    resp["t_recv"] = t_recv          # server wall clock (ms) when headers arrived
+    resp["t_body"] = t_body          # ... when the full upload had arrived
+    resp["t_send"] = time.time() * 1000
+    resp["upload_bytes"] = len(body)
+    tmg = resp["timing"]
+    print(f"[{mode:9s}] #{resp['idx']:5d} {len(body)/1024:5.1f}KB dirty={resp['n_dirty']:4d} "
+          f"{'R' if resp['refresh'] else ' '} compute={tmg['compute']:6.1f} gpu={tmg['model']:5.1f} "
+          f"wait={tmg['gpu_wait']:5.1f} reg={tmg['register']:4.1f}", flush=True)
+    return web.json_response(resp)
+
+
+async def gpu_probe(request):
+    mode = _request_mode(request)
+    if mode in (None, "dashboard"):
+        mode = request.query.get("mode", "ouroboros")
+    return web.json_response(gpu_state.others_ms(mode))
+
+
+async def time_probe(request):
+    return web.json_response({"t": time.time() * 1000})
+
+
+async def reset(request):
+    mode = _request_mode(request)
+    for m, s in sessions.items():
+        if mode in (None, "dashboard", m):
+            s.__init__()
+    return web.json_response({"ok": True})
+
+
+# ---------------------------------------------------------------- live dashboard
+#
+# Every phone POSTs one small JSON report per displayed frame (plus, rate-limited,
+# a downscaled JPEG of what it is showing). The server keeps a short history per
+# mode and fans every report out to dashboard browsers over Server-Sent Events,
+# together with a once-a-second GPU-sharing summary.
+
+DASH_HTML = HERE / "dashboard.html"
+dash_history = deque(maxlen=900)
+dash_clients = set()
+dash_frames = {m: {"jpeg": None, "v": 0} for m in MODES}
+
+
+def _broadcast(event, data):
+    msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    for q in list(dash_clients):
+        if q.qsize() < 100:
+            q.put_nowait(msg)
+
+
+async def report(request):
+    rec = await request.json()
+    mode = str(rec.get("mode", "")).replace("_", "")
+    if mode not in MODES:
+        return web.json_response({"error": f"bad mode {mode!r}"}, status=400)
+    rec["mode"] = mode
+    img = rec.pop("image", None)
+    if img:
+        f = dash_frames[mode]
+        f["jpeg"] = base64.b64decode(img)
+        f["v"] += 1
+        rec["image_v"] = f["v"]
+    rec["server_t"] = time.time() * 1000
+    rec["client_ip"] = request.remote
+    dash_history.append(rec)
+    _broadcast("frame", rec)
+    return web.json_response({"ok": True})
+
+
+async def events(request):
+    resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                                       "X-Accel-Buffering": "no"})
+    await resp.prepare(request)
+    q = asyncio.Queue()
+    dash_clients.add(q)
+    try:
+        await resp.write(("event: snapshot\ndata: " + json.dumps(
+            {"history": list(dash_history), "now": time.time() * 1000}) + "\n\n").encode())
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=15)
+            except asyncio.TimeoutError:
+                msg = ": keepalive\n\n"
+            await resp.write(msg.encode())
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        dash_clients.discard(q)
+    return resp
+
+
+async def server_stats_loop(app):
+    async def loop():
+        while True:
+            await asyncio.sleep(1.0)
+            if dash_clients:
+                snap = gpu_stats.snapshot(); snap["now"] = time.time() * 1000
+                _broadcast("server", snap)
+    task = asyncio.create_task(loop())
+    yield
+    task.cancel()
+
+
+async def frame_jpg(request):
+    mode = request.query.get("mode", "ouroboros")
+    f = dash_frames.get(mode)
+    if not f or f["jpeg"] is None:
+        return web.Response(status=404)
+    return web.Response(body=f["jpeg"], content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+async def dash_reset(request):
+    dash_history.clear()
+    _broadcast("reset", {})
+    return web.json_response({"ok": True})
+
+
+async def dashboard(request):
+    return web.FileResponse(DASH_HTML, headers={"Cache-Control": "no-cache"})
+
+
+MODEL_DIR = HERE.parent / "build"   # tools/export_vitdet_onnx.py writes here
+
+
+async def model_file(request):
+    """Lets the on-device phone fetch the ~430MB ONNX once instead of shipping it in the APK."""
+    name = request.match_info["name"]
+    path = (MODEL_DIR / name).resolve()
+    if path.parent != MODEL_DIR.resolve() or not path.is_file():
+        return web.json_response({"error": f"no model {name!r}"}, status=404)
+    return web.FileResponse(path)
+
+
+async def ports_info(request):
+    return web.json_response({m: p for p, m in port_mode.items()})
+
+
+def warmup():
+    dummy = np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8)
+    with torch.no_grad():
+        for _ in range(5):
+            _, cache = model.forward_contexted(dummy)
+        for frac in (0.05, 0.3, 0.7):   # also warm the partial path at a few densities
+            dm = (torch.rand(1, GRID, GRID, 1, device=device) < frac).float()
+            for _ in range(3):
+                _, cache = model.forward_contexted(dummy, anchor_features=cache, dirtiness_map=dm)
+    _sync()
+
+
+def main():
+    global model, device, gop, registration_mode
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--dashboard-port", type=int, default=65432)
+    ap.add_argument("--naive-port", type=int, default=65433)
+    ap.add_argument("--ouroboros-port", type=int, default=65434)
+    ap.add_argument("--ondevice-port", type=int, default=65435)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--gop", type=int, default=20)
+    ap.add_argument("--registration", default="rigid", choices=["rigid", "affine"])
+    args = ap.parse_args()
+    device, gop, registration_mode = args.device, args.gop, args.registration
+    port_mode.update({args.dashboard_port: "dashboard", args.naive_port: "naive",
+                      args.ouroboros_port: "ouroboros", args.ondevice_port: "ondevice"})
+
+    os.chdir(OFFLOAD_DIR)  # model code resolves some paths relative to offload/
+    from models import MaskedRCNN_ViT_B_FPN_Contexted
+    model = MaskedRCNN_ViT_B_FPN_Contexted(device=device)
+    model.load_weight(str(OFFLOAD_DIR / "models" / "model_final_61ccd1.pkl"))
+    model.eval()
+    warmup()
+
+    app = web.Application(client_max_size=16 * 1024 * 1024)
+    app.router.add_post("/v1/infer", infer)
+    app.router.add_get("/v1/time", time_probe)
+    app.router.add_get("/v1/gpu", gpu_probe)
+    app.router.add_post("/v1/reset", reset)
+    app.router.add_get("/v1/model/{name}", model_file)
+    app.router.add_post("/v1/report", report)
+    app.router.add_get("/v1/events", events)
+    app.router.add_get("/v1/frame.jpg", frame_jpg)
+    app.router.add_post("/v1/dashboard/reset", dash_reset)
+    app.router.add_get("/v1/ports", ports_info)
+    app.router.add_get("/", dashboard)
+    app.cleanup_ctx.append(server_stats_loop)
+
+    async def serve():
+        runner = web.AppRunner(app, shutdown_timeout=2.0)
+        await runner.setup()
+        for port in port_mode:
+            await web.TCPSite(runner, args.host, port).start()
+        print(f"ready: Ouroboros={OUROBOROS_ROOT} gop={gop} reg={registration_mode} | "
+              + " ".join(f"{m}:{p}" for p, m in port_mode.items()), flush=True)
+        await asyncio.Event().wait()
+
+    asyncio.run(serve())
+
+
+if __name__ == "__main__":
+    main()

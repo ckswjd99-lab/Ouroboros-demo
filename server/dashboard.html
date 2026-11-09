@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ouroboros Live</title>
+<style>
+  :root {
+    --bg: #0d0f12; --panel: #161a20; --panel2: #1d222a; --line: #2a313b;
+    --text: #e8ecf1; --muted: #8b96a5; --dim: #5d6773;
+    --ondevice: #ff5c5c; --naive: #40c4ff; --ouroboros: #69f0ae; --pred: #ffb74d;
+    --enc: #b39ddb; --up: #4fc3f7; --srv: #69f0ae; --wait: #e57373; --down: #4db6ac; --draw: #90a4ae; --prep: #ffab91; --infer: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+  .wrap { max-width: 1600px; margin: 0 auto; padding: 14px 16px 24px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  header h1 { font-size: 20px; margin: 0; }
+  header h1 b { color: var(--ouroboros); }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; background: var(--panel2); white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; display: inline-block; margin-right: 6px; vertical-align: 0; }
+  .dot.on { background: #4caf50; box-shadow: 0 0 8px #4caf50; }
+  .spacer { flex: 1; }
+  button { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; cursor: pointer; font: inherit; }
+  button:hover { color: var(--text); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+  .card h2 { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin: 0 0 10px; }
+
+  .lanes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  @media (max-width: 980px) { .lanes { grid-template-columns: 1fr; } }
+  .lane { border-top: 4px solid var(--c); display: flex; flex-direction: column; gap: 10px; }
+  .lane.offline { opacity: .55; }
+  .lane-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .lane-h .name { font-size: 18px; font-weight: 800; color: var(--c); }
+  .lane-h .dev { color: var(--muted); font-size: 12px; }
+  .lane-h .st { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .frame { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; }
+  .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .frame .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); text-align: center; padding: 10px; }
+  .big { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .big .v { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; color: var(--c); }
+  .big .v small, .big .f small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 2px; }
+  .big .f { font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; }
+  .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-height: 1.45em; }
+  .bar { display: flex; height: 16px; border-radius: 5px; overflow: hidden; background: var(--panel2); }
+  .bar div { height: 100%; min-width: 2px; }
+  .barlabels { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 6px; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 2.9em; }
+  .barlabels i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+  .patch { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .patch .track { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .patch .fill { height: 100%; background: var(--c); }
+  .dets { color: var(--muted); font-size: 12px; min-height: 1.45em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .row2 { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 14px; margin-top: 14px; }
+  @media (max-width: 980px) { .row2 { grid-template-columns: 1fr; } }
+  canvas { width: 100%; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 5px; border-radius: 2px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td, th { padding: 6px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td:first-child, th:first-child { text-align: left; }
+  .scroll { overflow-x: auto; }
+  .share { display: grid; grid-template-columns: 96px 1fr 64px; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
+  .share .track { height: 14px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .share .fill { height: 100%; border-radius: 4px; transition: width .5s; }
+  .share .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .note { color: var(--dim); font-size: 12px; margin-top: 8px; }
+
+  .pred { margin-top: 14px; }
+  .predbig { display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap; }
+  .predbig .l { color: var(--muted); font-size: 12px; }
+  .predbig .v { font-size: 28px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .pgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
+  @media (max-width: 980px) { .pgrid { grid-template-columns: 1fr; } }
+  .wi .track { height: 9px; background: var(--panel2); border-radius: 4px; overflow: hidden; min-width: 50px; }
+  .wi .fill { height: 100%; background: var(--pred); }
+  .wi tr.sel td { color: var(--pred); font-weight: 700; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><b>Ouroboros</b> Live — On-device vs Naive offload vs Ouroboros</h1>
+    <span class="pill"><span class="dot" id="dot"></span><span id="connText">연결 중…</span></span>
+    <span class="pill" id="gpuPill">GPU —</span>
+    <span class="spacer"></span>
+    <button id="resetBtn" title="대시보드 기록만 초기화 (앱/서버 동작에는 영향 없음)">기록 초기화</button>
+  </header>
+
+  <div class="lanes" id="lanes"></div>
+
+  <div class="row2">
+    <div class="card">
+      <h2>e2e latency — 최근 60초 (세 기기 동시)</h2>
+      <canvas id="timeline" height="270"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--ondevice)"></i>On-device</span>
+        <span><i style="background:var(--naive)"></i>Naive offload</span>
+        <span><i style="background:var(--ouroboros)"></i>Ouroboros</span>
+        <span><i style="background:repeating-linear-gradient(90deg,var(--pred) 0 5px,transparent 5px 8px)"></i>Ouroboros 예측 e2e</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>서버 GPU 공유 (최근 5초, 하나의 GPU를 두 방식이 나눠 씀)</h2>
+      <div id="share"></div>
+      <div class="scroll" style="margin-top:10px">
+        <table id="cmpTable"></table>
+      </div>
+      <div class="note">GPU 점유 = 그 방식의 ViT 연산이 GPU를 잡고 있던 시간 비율. GPU 대기 = 다른 방식의 요청이 GPU를 쓰는 동안 기다린 시간. 각 방식 최대 1대, 서버 측 CPU 전처리(디코드·정합·dirty map)는 병렬로 처리.</div>
+    </div>
+  </div>
+
+  <div class="card pred hidden" id="predCard">
+    <h2>Ouroboros e2e latency 예측 — 모바일이 재연산 패치 수를 병렬로 계산해서, 결과 도착 전에 예측</h2>
+    <div class="predbig">
+      <div><div class="l">예측</div><div class="v" id="pEst" style="color:var(--pred)">—</div></div>
+      <div><div class="l">실제</div><div class="v" id="pAct">—</div></div>
+      <div><div class="l">오차</div><div class="v" id="pErr">—</div></div>
+      <div><div class="l">예측 완료 시점</div><div class="v" id="pReady" style="font-size:22px">—</div></div>
+      <div class="muted" id="pWhen" style="font-size:13px"></div>
+    </div>
+    <div class="scroll" style="margin-top:10px">
+      <table>
+        <tr><th>누적 정확도</th><th>MAE</th><th>bias</th><th>±10% 이내</th><th>±20% 이내</th><th>패치 수 MAE</th><th>패치 수 정확 일치</th></tr>
+        <tr><td id="pCount">—</td><td id="pMae">—</td><td id="pBias">—</td><td id="pW10">—</td><td id="pW20">—</td><td id="pNMae">—</td><td id="pNEx">—</td></tr>
+      </table>
+    </div>
+    <div class="pgrid">
+      <div>
+        <div class="muted" style="margin-bottom:4px">What-if: 이 프레임을 다른 threshold로 보냈다면</div>
+        <table class="wi" id="wiTable"></table>
+      </div>
+      <div>
+        <div class="muted" style="margin-bottom:6px">예측 분해 (ms)</div>
+        <div class="bar" id="pBar" style="height:20px"></div>
+        <div class="barlabels" id="pLabels"></div>
+      </div>
+      <div>
+        <div class="muted" style="margin-bottom:6px">런타임 프로파일링으로 갱신 중인 모델</div>
+        <div class="mono" id="pModels"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const MODES = {
+  ondevice:  { label: "On-device",     color: "#ff5c5c", stale: 60000, where: "폰에서 ViTDet-B 직접 실행" },
+  naive:     { label: "Naive offload", color: "#40c4ff", stale: 5000,  where: "매 프레임 서버에서 전체 연산" },
+  ouroboros: { label: "Ouroboros",     color: "#69f0ae", stale: 5000,  where: "정합 + wrap-around + 부분 재연산" },
+};
+const ORDER = ["ondevice", "naive", "ouroboros"];
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+const median = a => { a = a.filter(v => v != null && isFinite(v)); if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const fpsFmt = f => f == null || !isFinite(f) ? "—" : f.toFixed(f < 1 ? 3 : f < 10 ? 2 : 1);
+
+let hist = [], server = null, clockSkew = 0, dirty = true;
+const norm = r => { r.mode = String(r.mode || "").replace(/_/g, ""); return r; };
+
+// ---- lanes (static skeleton, updated in place so nothing jumps) ----
+$("lanes").innerHTML = ORDER.map(k => { const m = MODES[k]; return `
+  <div class="card lane offline" id="lane-${k}" style="--c:${m.color}">
+    <div class="lane-h"><span class="name">${m.label}</span><span class="dev" id="dev-${k}">기기 없음</span><span class="st" id="st-${k}">대기</span></div>
+    <div class="frame"><img id="img-${k}" alt=""><div class="empty" id="empty-${k}">${m.where}<br>기기 연결 대기 중</div></div>
+    <div class="big"><div class="v" id="e2e-${k}">—<small>ms</small></div><div class="f" id="fps-${k}">—<small>FPS</small></div></div>
+    <div class="sub" id="sub-${k}">&nbsp;</div>
+    <div class="patch" id="patch-${k}"><span>재연산</span><div class="track"><div class="fill" id="pfill-${k}" style="width:0"></div></div><span id="pnum-${k}">—</span></div>
+    <div><div class="bar" id="bar-${k}"></div><div class="barlabels" id="lab-${k}"></div></div>
+    <div class="dets" id="dets-${k}">&nbsp;</div>
+  </div>`; }).join("");
+
+function connect() {
+  const es = new EventSource("v1/events");
+  es.addEventListener("open", () => { $("dot").classList.add("on"); $("connText").textContent = "실시간"; });
+  es.addEventListener("error", () => { $("dot").classList.remove("on"); $("connText").textContent = "재연결 중…"; });
+  es.addEventListener("snapshot", e => { const d = JSON.parse(e.data); hist = d.history.map(norm); clockSkew = d.now - Date.now(); dirty = true; });
+  es.addEventListener("frame", e => { hist.push(norm(JSON.parse(e.data))); if (hist.length > 900) hist.shift(); dirty = true; });
+  es.addEventListener("server", e => { server = JSON.parse(e.data); clockSkew = server.now - Date.now(); dirty = true; });
+  es.addEventListener("reset", () => { hist = []; dirty = true; });
+}
+$("resetBtn").onclick = () => fetch("v1/dashboard/reset", { method: "POST" });
+setInterval(() => { dirty = true; }, 1000);   // keep "N초 전" / online state fresh
+
+const imgV = {};
+function render() {
+  requestAnimationFrame(render);
+  if (!dirty) return; dirty = false;
+  const now = Date.now() + clockSkew;
+  for (const k of ORDER) renderLane(k, now);
+  drawTimeline(now);
+  renderShare();
+  renderPred();
+  $("gpuPill").textContent = server ? `GPU 사용률 ${fmt(100 * server.gpu_util)}%` : "GPU —";
+}
+
+function renderLane(k, now) {
+  const m = MODES[k];
+  const xs = hist.filter(r => r.mode === k);
+  const r = xs[xs.length - 1];
+  const lane = $("lane-" + k);
+  if (!r) { lane.classList.add("offline"); $("st-" + k).textContent = "대기"; return; }
+  const age = now - r.server_t;
+  lane.classList.toggle("offline", age > m.stale);
+  $("dev-" + k).textContent = r.device || "";
+  $("st-" + k).textContent = age > m.stale ? `끊김 (${fmt(age / 1000)}초 전)` : age > 2000 ? `${fmt(age / 1000)}초 전` : "실행 중";
+  const iv = [...xs].reverse().find(x => x.image_v)?.image_v;
+  if (iv && iv !== imgV[k]) { imgV[k] = iv; $("img-" + k).src = `v1/frame.jpg?mode=${k}&v=${iv}`; $("empty-" + k).classList.add("hidden"); }
+  $("e2e-" + k).innerHTML = `${fmt(r.e2e)}<small>ms</small>`;
+  $("fps-" + k).innerHTML = `${fpsFmt(r.fps)}<small>FPS</small>`;
+  $("dets-" + k).textContent = r.dets && r.dets.length ? r.dets.map(d => `${d.name} ${d.score.toFixed(2)}`).join(" · ") : "검출 없음";
+  const o = r.offload, od = r.ondevice;
+  let segs = [];
+  if (od) {
+    $("sub-" + k).textContent = `#${r.frame} · 최근 평균 ${fmt(r.avg30)} ms · ViTDet-B ONNX (CPU)`;
+    $("patch-" + k).classList.add("hidden");
+    segs = [["준비", od.prep, "var(--prep)"], ["ViTDet-B 추론 (폰)", od.infer, "var(--infer)"]];
+  } else if (o) {
+    const t = o.timing || {};
+    $("sub-" + k).textContent = `#${r.frame} · 최근 평균 ${fmt(r.avg30)} ms · ${fmt(o.kb, 1)} KB/frame` + (o.refresh && k === "ouroboros" ? ` · refresh(${o.refresh_reason})` : "");
+    $("patch-" + k).classList.remove("hidden");
+    $("pfill-" + k).style.width = `${100 * o.n_dirty / 4096}%`;
+    $("pnum-" + k).textContent = `${o.n_dirty}/4096`;
+    const wait = t.gpu_wait || 0;
+    segs = [["인코딩", o.encode, "var(--enc)"], ["업로드", o.upload, "var(--up)"],
+            ["GPU 대기", wait, "var(--wait)"], ["서버 연산", o.compute, "var(--srv)"],
+            ["기타", Math.max(0, o.server - o.compute - wait), "#33691e"],
+            ["다운로드", o.download, "var(--down)"], ["그리기", o.draw, "var(--draw)"]];
+  }
+  stackBar($("bar-" + k), $("lab-" + k), segs);
+}
+
+function stackBar(bar, labels, segs) {
+  segs = segs.filter(s => s[1] != null && isFinite(s[1]) && s[1] > 0.05);
+  const tot = segs.reduce((a, s) => a + s[1], 0) || 1;
+  bar.innerHTML = segs.map(s => `<div title="${s[0]} ${s[1].toFixed(1)} ms" style="width:${100 * s[1] / tot}%;background:${s[2]}"></div>`).join("");
+  labels.innerHTML = segs.map(s => `<span><i style="background:${s[2]}"></i>${s[0]} <b style="color:var(--text)">${s[1] >= 1000 ? fmt(s[1]) : s[1].toFixed(1)}</b></span>`).join("");
+}
+
+function renderShare() {
+  const rows = ORDER.map(k => {
+    const xs = hist.filter(r => r.mode === k).slice(-30);
+    const s = server && server[k];
+    return { k, m: MODES[k], n: xs.length, e2e: median(xs.map(r => r.e2e)), fps: xs.length ? xs[xs.length - 1].fps : null,
+      gpu: s ? s.gpu_ms : null, wait: s ? s.wait_ms : null, share: s ? s.gpu_share : null,
+      patches: median(xs.map(r => r.offload?.n_dirty)) };
+  });
+  $("share").innerHTML = rows.filter(r => r.k !== "ondevice").map(r => `<div class="share">
+      <span style="color:${r.m.color};font-weight:700">${r.m.label}</span>
+      <div class="track"><div class="fill" style="width:${100 * (r.share || 0)}%;background:${r.m.color}"></div></div>
+      <span class="num">${r.share == null ? "—" : fmt(100 * r.share) + "%"}</span></div>`).join("")
+    + `<div class="share"><span class="muted">유휴</span><div class="track"><div class="fill" style="width:${server ? 100 * Math.max(0, 1 - server.gpu_util) : 0}%;background:#3a4350"></div></div><span class="num">${server ? fmt(100 * Math.max(0, 1 - server.gpu_util)) + "%" : "—"}</span></div>`;
+  $("cmpTable").innerHTML = `<tr><th></th><th>e2e (중앙값)</th><th>FPS</th><th>GPU/frame</th><th>GPU 대기</th><th>재연산 패치</th></tr>` +
+    rows.map(r => `<tr><td style="color:${r.m.color};font-weight:700">${r.m.label}</td>
+      <td>${r.n ? fmt(r.e2e) + " ms" : "—"}</td><td>${r.n ? fpsFmt(r.fps) : "—"}</td>
+      <td>${r.k === "ondevice" ? "0 (폰)" : r.gpu == null ? "—" : fmt(r.gpu, 1) + " ms"}</td>
+      <td>${r.k === "ondevice" ? "—" : r.wait == null ? "—" : fmt(r.wait, 1) + " ms"}</td>
+      <td>${r.k === "ouroboros" && isFinite(r.patches) ? fmt(r.patches) + " / 4096" : r.k === "naive" ? "4096 / 4096" : "—"}</td></tr>`).join("");
+}
+
+function renderPred() {
+  const xs = hist.filter(r => r.mode === "ouroboros");
+  const r = xs[xs.length - 1];
+  $("predCard").classList.toggle("hidden", !(r && r.predict_on));
+  if (!r || !r.predict_on) return;
+  const p = r.pred, o = r.offload;
+  if (!p) { $("pWhen").textContent = "서버와 anchor 동기화 중…"; return; }
+  const err = r.e2e - p.est;
+  $("pEst").textContent = `${fmt(p.est)} ms`; $("pAct").textContent = `${fmt(r.e2e)} ms`;
+  $("pErr").textContent = `${err >= 0 ? "+" : ""}${fmt(err)} ms`;
+  $("pErr").style.color = Math.abs(err) / r.e2e <= 0.1 ? "#69f0ae" : Math.abs(err) / r.e2e <= 0.2 ? "#ffd54f" : "#ff8a80";
+  $("pReady").textContent = `+${fmt(p.ready_at)} ms`;
+  $("pWhen").innerHTML = `전송 시작 후 이 시점에 예측 확정 (모바일 mirror ${fmt(p.mirror_ms, 1)} ms)<br>재연산 패치 예측 ${p.n_pred} / 서버 실제 ${o ? o.n_dirty : "—"}<br>` +
+    `GPU 대기 예측 ${fmt(p.gpu_wait_pred, 0)} / 실제 ${fmt(o?.timing?.gpu_wait, 0)} ms (probe: 다른 기기 GPU 잔여 ${fmt(p.gpu_others, 0)} ms)`;
+  $("pCount").textContent = `최근 ${p.count}프레임`;
+  $("pMae").textContent = `${fmt(p.mae, 1)} ms`; $("pBias").textContent = `${p.bias >= 0 ? "+" : ""}${fmt(p.bias, 1)} ms`;
+  $("pW10").textContent = `${fmt(100 * p.w10)}%`; $("pW20").textContent = `${fmt(100 * p.w20)}%`;
+  $("pNMae").textContent = fmt(p.n_mae, 1); $("pNEx").textContent = `${fmt(100 * p.n_exact)}%`;
+  const maxMs = Math.max(...p.what_if.map(w => w[2]));
+  $("wiTable").innerHTML = "<tr><th>thr</th><th>패치</th><th>예측 e2e</th><th></th></tr>" + p.what_if.map(([t, n, ms]) =>
+    `<tr class="${o && t === o.thres ? "sel" : ""}"><td>${t}</td><td>${n}</td><td>${fmt(ms)} ms</td>` +
+    `<td style="width:38%"><div class="track"><div class="fill" style="width:${100 * ms / maxMs}%"></div></div></td></tr>`).join("");
+  const pp = p.parts;
+  stackBar($("pBar"), $("pLabels"), [["인코딩", pp.encode, "var(--enc)"], ["네트워크", pp.network, "var(--up)"],
+    ["GPU 대기", pp.gpu_wait, "var(--wait)"], ["서버 연산", pp.compute, "var(--srv)"],
+    ["기타", (pp.server_overhead || 0) + (pp.post || 0), "var(--draw)"]]);
+  $("pModels").innerHTML = `${p.compute_model}<br>${p.network_model}`;
+}
+
+function setupCanvas(c) {
+  if (!c.dataset.h) c.dataset.h = c.getAttribute("height");
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = +c.dataset.h;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); c.style.height = h + "px"; }
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  return [g, w, h];
+}
+
+function drawTimeline(now) {
+  const [g, W, H] = setupCanvas($("timeline"));
+  const SPAN = 60000;
+  const data = hist.filter(r => now - r.server_t <= SPAN + 20000);
+  const L = 50, R = 10, T = 10, B = 24, w = W - L - R, h = H - T - B;
+  const vals = data.flatMap(r => [r.e2e, r.pred?.est]).filter(v => v != null && isFinite(v));
+  const maxV = Math.max(150, ...vals) * 1.1;
+  const useLog = maxV > 1200;
+  const minV = useLog ? 30 : 0;
+  const y = v => useLog ? T + h * (1 - (Math.log(Math.max(v, minV)) - Math.log(minV)) / (Math.log(maxV) - Math.log(minV))) : T + h * (1 - v / maxV);
+  const x = t => L + w * (1 - (now - t) / SPAN);
+  g.font = "11px system-ui"; g.strokeStyle = "#2a313b"; g.lineWidth = 1; g.fillStyle = "#8b96a5";
+  const ticks = useLog ? [30, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000].filter(t => t <= maxV)
+                       : [0, .25, .5, .75, 1].map(f => Math.round(maxV * f));
+  for (const t of ticks) { const yy = y(t); g.beginPath(); g.moveTo(L, yy); g.lineTo(L + w, yy); g.stroke(); g.fillText(t >= 1000 ? (t / 1000) + "s" : t + "", 6, yy + 4); }
+  for (let s = 0; s <= 60; s += 10) { const xx = x(now - s * 1000); g.fillText(s ? `-${s}s` : "now", xx - 10, H - 6); }
+  if (useLog) { g.fillStyle = "#5d6773"; g.fillText("ms, log scale", L + 4, T + 12); }
+  g.save(); g.beginPath(); g.rect(L, T - 4, w, h + 8); g.clip();
+  for (const k of ORDER) {
+    const xs = data.filter(r => r.mode === k);
+    g.strokeStyle = MODES[k].color; g.fillStyle = MODES[k].color; g.lineWidth = 2.2;
+    g.beginPath(); xs.forEach((r, i) => { const px = x(r.server_t), py = y(r.e2e); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
+    if (k === "ondevice") xs.forEach(r => { g.beginPath(); g.arc(x(r.server_t), y(r.e2e), 4, 0, 7); g.fill(); });
+  }
+  const ps = data.filter(r => r.mode === "ouroboros" && r.pred);
+  g.strokeStyle = "#ffb74d"; g.lineWidth = 1.8; g.setLineDash([6, 4]);
+  g.beginPath(); ps.forEach((r, i) => { const px = x(r.server_t), py = y(r.pred.est); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
+  g.setLineDash([]); g.restore();
+  if (!data.length) { g.fillStyle = "#5d6773"; g.fillText("데이터 대기 중", L + w / 2 - 40, T + h / 2); }
+}
+
+window.addEventListener("resize", () => { dirty = true; });
+connect(); requestAnimationFrame(render);
+</script>
+</body>
+</html>
