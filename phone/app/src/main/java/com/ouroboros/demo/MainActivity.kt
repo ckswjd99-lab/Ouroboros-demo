@@ -72,6 +72,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var seekThres: SeekBar
     private lateinit var txtThres: TextView
     private lateinit var checkPredict: CheckBox
+    private lateinit var checkBoost: CheckBox
+    private lateinit var checkWorld: CheckBox
     private lateinit var editServer: EditText
     private lateinit var btnStart: Button
 
@@ -86,6 +88,12 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var thres = 20
     @Volatile private var predictOn = false
+    @Volatile private var boostOn = true        // green-boost the patches the server recomputed
+    @Volatile private var worldOn = false       // show the shared global (toroidal) canvas instead of the frame
+    private val worldView by lazy { RecomputeVis.WorldView() }
+    private val visExec = Executors.newSingleThreadExecutor()
+    private val worldBusy = AtomicBoolean(false)
+    @Volatile private var lastWorld: Bitmap? = null
     @Volatile private var resetNext = true
     private var mode = Mode.OUROBOROS
 
@@ -118,6 +126,9 @@ class MainActivity : AppCompatActivity() {
         seekThres = findViewById(R.id.seekThres); txtThres = findViewById(R.id.txtThres)
         checkPredict = findViewById(R.id.checkPredict); editServer = findViewById(R.id.editServer)
         btnStart = findViewById(R.id.btnStart)
+        checkBoost = findViewById(R.id.checkBoost); checkWorld = findViewById(R.id.checkWorld)
+        checkBoost.setOnCheckedChangeListener { _, on -> boostOn = on }
+        checkWorld.setOnCheckedChangeListener { _, on -> worldOn = on; if (on) worldView.clear() }
 
         if (!OpenCVLoader.initLocal()) Log.e(TAG, "OpenCV init failed")
 
@@ -151,6 +162,8 @@ class MainActivity : AppCompatActivity() {
         }
         if (intent.hasExtra("thres")) seekThres.progress = intent.getIntExtra("thres", 20)
         if (intent.hasExtra("predict")) checkPredict.isChecked = intent.getBooleanExtra("predict", false)
+        if (intent.hasExtra("boost")) checkBoost.isChecked = intent.getBooleanExtra("boost", true)
+        if (intent.hasExtra("world")) checkWorld.isChecked = intent.getBooleanExtra("world", false)
         if (intent.getBooleanExtra("autostart", false)) img.post { start() }
     }
 
@@ -164,6 +177,7 @@ class MainActivity : AppCompatActivity() {
         val ouro = mode == Mode.OUROBOROS
         findViewById<View>(R.id.rowThres).visibility = if (ouro) View.VISIBLE else View.GONE
         checkPredict.visibility = if (ouro) View.VISIBLE else View.GONE
+        findViewById<View>(R.id.rowVis).visibility = if (ouro) View.VISIBLE else View.GONE
         txtPredict.visibility = if (ouro && predictOn) View.VISIBLE else View.GONE
         when (mode) {
             Mode.ON_DEVICE -> chart.setSeries(LatencyChartView.Series("e2e", Color.CYAN),
@@ -184,7 +198,7 @@ class MainActivity : AppCompatActivity() {
         }
         setControlsEnabled(false); btnStart.text = "정지"
         e2eHist.clear(); doneTimes.clear(); frameNo = 0; chart.clear(); errStats.clear()
-        resetNext = true; mirrorInSync = false; mirror.reset()
+        resetNext = true; mirrorInSync = false; mirror.reset(); worldView.clear(); lastWorld = null
         val m = mode
         val host = editServer.text.toString().trim().removePrefix("http://").trimEnd('/')
         val addr = if (host.contains(':')) host else "$host:${m.port}"   // explicit host:port overrides
@@ -233,7 +247,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         running.set(false)
-        cameraExec.shutdown(); pipeExec.shutdown(); mirrorExec.shutdown(); probeExec.shutdown()
+        cameraExec.shutdown(); pipeExec.shutdown(); mirrorExec.shutdown(); probeExec.shutdown(); visExec.shutdown()
         detector?.close(); reporter?.shutdown()
         super.onDestroy()
     }
@@ -352,7 +366,22 @@ class MainActivity : AppCompatActivity() {
 
         val r = c.infer(jpeg, modeStr, th, reset)
         val tPost0 = OffloadClient.nowMs()
-        val vis = draw(frame, r.dets, m)
+        val info = if (m == Mode.OUROBOROS) RecomputeVis.Info(r.json) else null
+        val vis = draw(frame, r.dets, m, if (boostOn) info else null)
+        val showWorld = info != null && worldOn
+        // the global view is rendered off the critical path (latest frame wins), so it never
+        // changes the e2e latency being measured
+        if (showWorld && worldBusy.compareAndSet(false, true)) {
+            val dets = r.dets; val boost = boostOn; val col = m.color
+            visExec.execute {
+                try {
+                    val wb = worldView.update(frame, info!!, dets,
+                        org.opencv.core.Scalar(Color.red(col).toDouble(), Color.green(col).toDouble(), Color.blue(col).toDouble(), 255.0), boost)
+                    if (wb != null) { lastWorld = wb; ui { if (worldOn && mode == Mode.OUROBOROS) img.setImageBitmap(wb) } }
+                } catch (e: Exception) { Log.e(TAG, "world view failed", e) }
+                finally { worldBusy.set(false) }
+            }
+        }
         val tDone = OffloadClient.nowMs()
         val e2e = tDone - t0
         val clientPost = tDone - tPost0
@@ -420,7 +449,8 @@ class MainActivity : AppCompatActivity() {
             e2e, encMs, r.uploadMs, r.computeMs, r.downloadMs, r.nDirty, th, r.refresh,
             pend?.est?.totalMs?.let { "%.1f".format(it) } ?: "", pend?.pred?.nDirty?.toString() ?: "", jpeg.size))
         ui {
-            img.setImageBitmap(vis); setStatus(e2e); txtStats.text = stats
+            if (!showWorld) img.setImageBitmap(vis)
+            setStatus(e2e); txtStats.text = stats
             if (m == Mode.OUROBOROS && predictOn) txtPredict.text = predText
         }
         val rec = baseRecord(m, e2e, r.dets).put("offload", J()
@@ -429,6 +459,7 @@ class MainActivity : AppCompatActivity() {
             .put("n_dirty", r.nDirty).put("refresh", r.refresh).put("refresh_reason", r.json.opt("refresh_reason"))
             .put("thres", th).put("kb", kb))
         rec.put("predict_on", m == Mode.OUROBOROS && predictOn)
+        rec.put("boost", info != null && boostOn).put("world_view", showWorld)
         if (pend != null) {
             val wi = JSONArray(); pend.whatIfEst.forEach { (wt, n, ms) -> wi.put(JSONArray().put(wt).put(n).put(ms)) }
             rec.put("pred", J()
@@ -446,7 +477,7 @@ class MainActivity : AppCompatActivity() {
                 .put("compute_model", synchronized(predictor) { predictor.computeModelText() })
                 .put("network_model", synchronized(predictor) { predictor.networkText() }))
         }
-        reporter?.offer(rec, vis)
+        reporter?.offer(rec, if (showWorld) lastWorld ?: vis else vis)
     }
 
     private fun baseRecord(m: Mode, e2e: Double, dets: List<Det>): JSONObject {
@@ -483,8 +514,9 @@ class MainActivity : AppCompatActivity() {
     private val bannerText = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 26f; isFakeBoldText = true; setShadowLayer(4f, 0f, 0f, Color.BLACK) }
 
     /** Boxes on the very frame that was captured/sent. */
-    private fun draw(frame: Bitmap, dets: List<Det>, m: Mode): Bitmap {
+    private fun draw(frame: Bitmap, dets: List<Det>, m: Mode, boost: RecomputeVis.Info? = null): Bitmap {
         val out = frame.copy(Bitmap.Config.ARGB_8888, true)
+        if (boost != null) try { RecomputeVis.boostFrame(out, boost) } catch (e: Exception) { Log.e(TAG, "boost failed", e) }
         val cv = Canvas(out); val w = out.width; val h = out.height
         boxPaint.color = m.color; labelBg.color = m.color
         for (d in dets) {

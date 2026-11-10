@@ -94,6 +94,28 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 - LMEDS RNG is seeded identically on both sides before registration (`REG_RNG_SEED`).
 - Dashboard 3-column desktop layout verified in headless Chromium (no console errors).
 
+## Visualisation options (2026-11-10)
+- **Recomputed-patch green boost** (default ON; upstream's `img[...,1] = clip(img[...,1] + dmap*30, 0, 255)`).
+  Drawn on the camera frame: each frame pixel looks its patch up through the server's affine
+  (`server/vis.py recompute_mask`, `RecomputeVis.boostFrame`); verified pixel-exact against a direct
+  per-pixel lookup (0 mismatches / 38 frames). A refresh (GOP) frame is all green.
+  App: checkbox "재연산 패치 초록 표시" / `--ez boost false`; sim: `--no-boost`; server global view:
+  `--no-boost` or dashboard button / `POST /v1/vis?boost=0`.
+- **Shared global coordinate view** (wrap-around torus). Server returns `world` = cumulative roll of the
+  canvas (mod 1024) and `world_reset`; on a GOP refresh it registers the new frame once against the outgoing
+  anchor (~5 ms, refresh frames only) so the map stays continuous. Mosaic = each frame painted at
+  canvas+world; outline/boxes drawn in canvas coords then rolled, so they wrap too.
+  - Server: rendered off the request path (≤10 Hz) → `GET /v1/world.jpg`; dashboard Ouroboros lane
+    "폰 화면 / 서버 global 좌표" switch. `--no-world-vis` / `POST /v1/vis?world=0` to disable.
+  - App: checkbox "global 좌표 보기" / `--ez world true`; rendered on its own thread, not in e2e
+    (Pixel: still 8.0 FPS, 96 ms).
+  - Synthetic 14 px/frame pan: world step 14.0 ± 0.5 px per frame, continuous across every refresh, wraps.
+- Finding: on the 40-frame bear clip (loops), upstream rigid registration sometimes returns garbage
+  (e.g. 83° rotation after a GOP): `estimate_affine_in_padded_anchor_fast(mode="rigid")` normalises the
+  LMEDS scale away, so a degenerate fit becomes a full-size rotation and the scale<0.95 refresh check never
+  fires. Global view makes it visible. Possible fix (needs the phone mirror to match): reject when the raw
+  LMEDS scale is far from 1 or rotation is large → reg_fail refresh.
+
 ## Findings worth knowing
 - The create_dirtiness_map chain (>thr → blur15 → resize 1/16 linear → >0) equals "max of blurred
   residual over the 16×16 patch > thr" (verified on 1800 cases) — the phone uses a 64×64 max-pool.

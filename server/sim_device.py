@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from coco import COCO
+from vis import boost_recomputed
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--mode", required=True, choices=["naive", "ouroboros", "ondevice"])
@@ -27,6 +28,8 @@ ap.add_argument("--thres", type=int, default=20)
 ap.add_argument("--threads", type=int, default=4, help="ondevice: CPU threads for onnxruntime")
 ap.add_argument("--onnx", default=str(Path(__file__).resolve().parent.parent / "build" / "vitdet_b.onnx"))
 ap.add_argument("--name", default=None)
+ap.add_argument("--no-boost", action="store_true",
+                help="ouroboros: do not tint the recomputed patches green (on by default)")
 ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = forever)")
 ap.add_argument("--net-ms", type=float, default=0,
                 help="emulated one-way network delay added before the upload and after the reply, "
@@ -55,8 +58,8 @@ def http(path, data=None, ctype="image/jpeg"):
     return urllib.request.urlopen(req, timeout=60).read()
 
 
-def draw(f, dets):
-    vis = f.copy(); H, W = vis.shape[:2]; c = COLORS[args.mode]
+def draw(vis, dets):
+    H, W = vis.shape[:2]; c = COLORS[args.mode]
     for d in dets:
         x0, y0, x1, y1 = d["box"]
         cv2.rectangle(vis, (int(x0 * W), int(y0 * H)), (int(x1 * W), int(y1 * H)), c, 2)
@@ -125,7 +128,11 @@ for f in frames():
                           "refresh": r["refresh"], "refresh_reason": r["refresh_reason"], "thres": args.thres,
                           "kb": len(jpg) / 1024}
         rec["predict_on"] = False
-    vis = draw(f, dets)
+        rec["boost"] = args.mode == "ouroboros" and not args.no_boost
+    vis = f.copy()
+    if rec.get("boost"):
+        boost_recomputed(vis, r)
+    vis = draw(vis, dets)
     e2e = (time.perf_counter() - t0) * 1000
     n += 1; hist.append(e2e); done.append(time.perf_counter())
     fps = (len(done) - 1) / (done[-1] - done[0]) if len(done) > 1 else None

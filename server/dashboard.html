@@ -37,6 +37,9 @@
   .lane-h .st { margin-left: auto; font-size: 12px; color: var(--muted); }
   .frame { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; }
   .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .viewsw { display: inline-flex; gap: 4px; }
+  .viewsw button { padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; }
+  .viewsw button.on { background: var(--c); color: #0d0f12; border-color: var(--c); }
   .frame .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); text-align: center; padding: 10px; }
   .big { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
   .big .v { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; color: var(--c); }
@@ -176,6 +179,9 @@ const norm = r => { r.mode = String(r.mode || "").replace(/_/g, ""); return r; }
 $("lanes").innerHTML = ORDER.map(k => { const m = MODES[k]; return `
   <div class="card lane offline" id="lane-${k}" style="--c:${m.color}">
     <div class="lane-h"><span class="name">${m.label}</span><span class="dev" id="dev-${k}">기기 없음</span><span class="st" id="st-${k}">대기</span></div>
+    ${k === "ouroboros" ? `<div class="lane-h"><span class="viewsw" title="폰이 보내는 화면 / 서버가 그리는 shared global 좌표 (wrap-around torus)">
+      <button data-view="phone" class="on">폰 화면</button><button data-view="world">서버 global 좌표</button></span>
+      <span class="viewsw" title="서버 global 화면에서 재연산된 patch 를 초록색으로 강조"><button id="srvBoost" class="on">서버: 재연산 초록</button></span></div>` : ""}
     <div class="frame"><img id="img-${k}" alt=""><div class="empty" id="empty-${k}">${m.where}<br>기기 연결 대기 중</div></div>
     <div class="big"><div class="v" id="e2e-${k}">—<small>ms</small></div><div class="f" id="fps-${k}">—<small>FPS</small></div></div>
     <div class="sub" id="sub-${k}">&nbsp;</div>
@@ -188,15 +194,22 @@ function connect() {
   const es = new EventSource("v1/events");
   es.addEventListener("open", () => { $("dot").classList.add("on"); $("connText").textContent = "실시간"; });
   es.addEventListener("error", () => { $("dot").classList.remove("on"); $("connText").textContent = "재연결 중…"; });
-  es.addEventListener("snapshot", e => { const d = JSON.parse(e.data); hist = d.history.map(norm); clockSkew = d.now - Date.now(); dirty = true; });
+  es.addEventListener("snapshot", e => { const d = JSON.parse(e.data); hist = d.history.map(norm); visCfg = d.vis || visCfg; worldV = d.world_v || 0; clockSkew = d.now - Date.now(); dirty = true; });
   es.addEventListener("frame", e => { hist.push(norm(JSON.parse(e.data))); if (hist.length > 900) hist.shift(); dirty = true; });
   es.addEventListener("server", e => { server = JSON.parse(e.data); clockSkew = server.now - Date.now(); dirty = true; });
   es.addEventListener("reset", () => { hist = []; dirty = true; });
+  es.addEventListener("world", e => { worldV = JSON.parse(e.data).v; dirty = true; });
+  es.addEventListener("vis", e => { visCfg = JSON.parse(e.data); dirty = true; });
 }
 $("resetBtn").onclick = () => fetch("v1/dashboard/reset", { method: "POST" });
 for (const b of document.querySelectorAll(".sched button"))
   b.onclick = () => fetch("v1/sched?policy=" + b.dataset.pol, { method: "POST" });
-setInterval(() => { dirty = true; }, 1000);   // keep "N초 전" / online state fresh
+setInterval(() => { dirty = true; }, 1000);
+// Ouroboros lane: the phone's own view, or the server's render of the shared global (toroidal) canvas
+let ouroView = "phone", worldV = 0, worldShown = -1, visCfg = { world: true, boost: true };
+for (const b of document.querySelectorAll("#lane-ouroboros .viewsw button[data-view]"))
+  b.onclick = () => { ouroView = b.dataset.view; imgV.ouroboros = null; worldShown = -1; dirty = true; };
+$("srvBoost").onclick = () => fetch("v1/vis?boost=" + (visCfg.boost ? 0 : 1), { method: "POST" });   // keep "N초 전" / online state fresh
 
 const imgV = {};
 function render() {
@@ -222,8 +235,15 @@ function renderLane(k, now) {
   lane.classList.toggle("offline", age > m.stale);
   $("dev-" + k).textContent = r.device || "";
   $("st-" + k).textContent = age > m.stale ? `끊김 (${fmt(age / 1000)}초 전)` : age > 2000 ? `${fmt(age / 1000)}초 전` : "실행 중";
+  if (k === "ouroboros") {
+    for (const b of document.querySelectorAll("#lane-ouroboros .viewsw button[data-view]")) b.classList.toggle("on", b.dataset.view === ouroView);
+    $("srvBoost").classList.toggle("on", !!visCfg.boost);
+    $("srvBoost").style.display = ouroView === "world" ? "" : "none";
+  }
   const iv = [...xs].reverse().find(x => x.image_v)?.image_v;
-  if (iv && iv !== imgV[k]) { imgV[k] = iv; $("img-" + k).src = `v1/frame.jpg?mode=${k}&v=${iv}`; $("empty-" + k).classList.add("hidden"); }
+  if (k === "ouroboros" && ouroView === "world") {
+    if (worldV && worldV !== worldShown) { worldShown = worldV; $("img-" + k).src = `v1/world.jpg?v=${worldV}`; $("empty-" + k).classList.add("hidden"); }
+  } else if (iv && iv !== imgV[k]) { imgV[k] = iv; $("img-" + k).src = `v1/frame.jpg?mode=${k}&v=${iv}`; $("empty-" + k).classList.add("hidden"); }
   $("e2e-" + k).innerHTML = `${fmt(r.e2e)}<small>ms</small>`;
   $("fps-" + k).innerHTML = `${fpsFmt(r.fps)}<small>FPS</small>`;
   $("dets-" + k).textContent = r.dets && r.dets.length ? r.dets.map(d => `${d.name} ${d.score.toFixed(2)}`).join(" · ") : "검출 없음";

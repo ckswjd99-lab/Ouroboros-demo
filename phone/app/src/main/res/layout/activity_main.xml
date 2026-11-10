@@ -47,6 +47,17 @@
             android:textColor="#FFFFFF"
             android:text="e2e latency 예측 (모바일에서 재연산 패치 수 병렬 계산)" />
 
+        <LinearLayout android:id="@+id/rowVis"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <CheckBox android:id="@+id/checkBoost" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:textColor="#FFFFFF" android:checked="true"
+                android:text="재연산 패치 초록 표시" />
+            <CheckBox android:id="@+id/checkWorld" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:textColor="#FFFFFF"
+                android:text="global 좌표 보기" />
+        </LinearLayout>
+
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal">
             <EditText android:id="@+id/editServer" android:layout_width="0dp" android:layout_weight="1"
