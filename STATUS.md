@@ -50,6 +50,10 @@ The SDK's adb is x86_64; under qemu the adb *server* segfaults. Working setup: U
 debs extracted (no sudo) into `~/.local/adb-arm64/root`, wrapper `~/.local/bin/adb` sets LD_LIBRARY_PATH
 (libprotobuf32t64 had to be fetched from the ports pool directly — local apt index was stale).
 Phone: Pixel 11 Pro XL, Android 17, `adb connect 147.46.118.129:25557` (key already authorized).
+Second Pixel 11 Pro XL (serial 67101FDDV004SJ): `adb connect 147.46.118.129:25558` (authorized; the first is 68051FDDV002TC
+on :25557). With two phones every adb call needs `-s 147.46.118.129:<port>`. The server keeps one session per *mode*, so
+the two phones must run different modes (e.g. Ouroboros + Naive); two on Ouroboros would share one anchor and corrupt it.
+Verified both ways round on a test server (MIG): 25557 Ouroboros + 25558 Naive, then swapped; ~4.5 FPS each, FIFO.
 
 ## Measured (Pixel 11 Pro XL on Wi-Fi, GH200 server)
 Single device:
