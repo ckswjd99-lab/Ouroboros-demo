@@ -21,9 +21,9 @@ import kotlin.math.max
  *    like upstream Ouroboros' `img[..., 1] = clip(img[..., 1] + dmap * 30, 0, 255)`, but on the
  *    camera frame: the dirtiness map is in canvas space (canvas = affine(resized frame)), so every
  *    frame pixel looks its patch up through the server's affine. A refresh recomputes everything.
- *  - [WorldView]: the shared global coordinate. The canvas is a torus that is rolled by whole
- *    patches as the camera pans; the server returns its cumulative roll as `world`. Painting each
- *    frame at canvas + world (mod 1024) shows it moving over a fixed map and wrapping at the edges.
+ *  - [WorldView]: the shared global coordinate, as upstream draws it: the anchor canvas (the image
+ *    whose cached features the server reuses) rolled by the cumulative wrap-around shift `world`.
+ *    The anchor is rebuilt from a centred frame at every refresh, so the view refreshes with it.
  */
 object RecomputeVis {
     const val CANVAS = OuroborosMirror.CANVAS
@@ -44,7 +44,9 @@ object RecomputeVis {
         val frameW: Int; val frameH: Int
         init { val wh = json.optJSONArray("frame_wh"); frameW = wh?.getInt(0) ?: 0; frameH = wh?.getInt(1) ?: 0 }
         val world: IntArray? = json.optJSONArray("world")?.let { intArrayOf(it.getInt(0), it.getInt(1)) }
-        val worldReset = json.optBoolean("world_reset", false)
+        val shift: IntArray? = json.optJSONArray("shift")?.let { intArrayOf(it.getInt(0), it.getInt(1)) }
+        val idx = json.optInt("idx", -1)
+        val gop = json.optInt("gop", 0)
         val scale get() = if (max(frameW, frameH) > MAX_DIM) MAX_DIM.toDouble() / max(frameW, frameH) else 1.0
         /** frame (sent-frame pixels) -> canvas, as a 2x3 row-major array */
         fun frameToCanvas(): DoubleArray {
@@ -86,85 +88,77 @@ object RecomputeVis {
         rgba.release(); mask.release()
     }
 
-    /** Toroidal world mosaic of the Ouroboros session (see server/vis.py WorldMosaic). */
+    /**
+     * The server's anchor canvas, kept in sync on the phone from what each response says (the same
+     * update the server makes): refresh -> centred frame; otherwise roll by -shift and copy in the
+     * warped frame where patches were recomputed. Shown rolled by the cumulative shift `world`.
+     * Every frame must go through [update] in order; [render]=false skips only the drawing.
+     */
     class WorldView(private val outSide: Int = 720) {
-        private val mosaic = Mat(CANVAS, CANVAS, CvType.CV_8UC4, Scalar(0.0, 0.0, 0.0, 255.0))
-        @Volatile private var needClear = false
-        fun clear() { needClear = true }
+        private var anchor: Mat? = null
+        /** Forget the anchor; the view resumes at the next refresh. */
+        fun clear() { anchor?.release(); anchor = null }
 
-        /** [frame]: the raw frame that was sent; [dets]: normalized boxes on it. RGBA colors. */
-        fun update(frame: Bitmap, info: Info, dets: List<Det>, boxColor: Scalar, boost: Boolean): Bitmap? {
+        fun update(frame: Bitmap, info: Info, dets: List<Det>, boxColor: Scalar, boost: Boolean, render: Boolean): Bitmap? {
             val world = info.world ?: return null
-            if (needClear || info.worldReset) { mosaic.setTo(Scalar(0.0, 0.0, 0.0, 255.0)); needClear = false }
-            val wx = world[0]; val wy = world[1]
             val f = Mat(); Utils.bitmapToMat(frame, f)
             val sendW = info.frameW.takeIf { it > 0 } ?: frame.width
             val sendH = info.frameH.takeIf { it > 0 } ?: frame.height
-            // displayed bitmap px -> sent-frame px -> canvas
-            val a = info.frameToCanvas()
+            val a = info.frameToCanvas()          // sent-frame px -> canvas
             val kx = sendW.toDouble() / frame.width; val ky = sendH.toDouble() / frame.height
             val A = doubleArrayOf(a[0] * kx, a[1] * ky, a[2], a[3] * kx, a[4] * ky, a[5])
             val am = mat23(A)
             val cs = Size(CANVAS.toDouble(), CANVAS.toDouble())
-            val layer = Mat(); Imgproc.warpAffine(f, layer, am, cs, Imgproc.INTER_LINEAR)
+            val target = Mat(); Imgproc.warpAffine(f, target, am, cs, Imgproc.INTER_LINEAR)
+            val d = Mat()
+            if (info.refresh || info.grid == null) {
+                d.create(CANVAS, CANVAS, CvType.CV_8U); d.setTo(Scalar(1.0))
+            } else { val gm = gridMat(info.grid); Imgproc.resize(gm, d, cs, 0.0, 0.0, Imgproc.INTER_NEAREST); gm.release() }
+
+            val prev = anchor
+            if (info.refresh) {
+                prev?.release(); anchor = target.clone()
+            } else if (prev != null && info.shift != null) {
+                val rolled = roll(prev, -info.shift[0], -info.shift[1]); prev.release()
+                target.copyTo(rolled, d); anchor = rolled
+            } else {                               // joined mid-GOP: wait for the next refresh
+                for (m in listOf(f, am, target, d)) m.release(); return null
+            }
+            if (!render) { for (m in listOf(f, am, target, d)) m.release(); return null }
+
+            val anc = anchor!!
             val ones = Mat(f.rows(), f.cols(), CvType.CV_8U, Scalar(255.0))
             val foot = Mat(); Imgproc.warpAffine(ones, foot, am, cs, Imgproc.INTER_NEAREST)
-            val footW = roll(foot, wx, wy); val layerW = roll(layer, wx, wy)
-            layerW.copyTo(mosaic, footW)            // the map keeps raw pixels
-
-            val out = Mat(); Core.multiply(mosaic, Scalar(DIM, DIM, DIM, 1.0), out)
-            mosaic.copyTo(out, footW)
-            if (boost) {                            // only the current frame shows what was recomputed
-                val d = Mat()
-                if (info.refresh || info.grid == null) foot.copyTo(d)
-                else {
-                    val gm = gridMat(info.grid); Imgproc.resize(gm, d, cs, 0.0, 0.0, Imgproc.INTER_NEAREST); gm.release()
-                    Core.bitwise_and(d, foot, d)
-                }
-                val dW = roll(d, wx, wy)
-                Core.add(out, Scalar(0.0, BOOST, 0.0, 0.0), out, dW); d.release(); dW.release()
-            }
-            var v = 0
-            while (v < CANVAS) {
-                val c = if (v == 0) Scalar(255.0, 160.0, 0.0, 255.0) else Scalar(70.0, 70.0, 70.0, 255.0)
-                Imgproc.line(out, Point(v.toDouble(), 0.0), Point(v.toDouble(), CANVAS - 1.0), c, 1)
-                Imgproc.line(out, Point(0.0, v.toDouble()), Point(CANVAS - 1.0, v.toDouble()), c, 1)
-                v += GRID_STEP
-            }
-
-            // outline + boxes in canvas coords, rolled with the frame so they wrap as well
-            val ov = Mat(CANVAS, CANVAS, CvType.CV_8UC4, Scalar(0.0, 0.0, 0.0, 0.0))
-            val om = Mat(CANVAS, CANVAS, CvType.CV_8U, Scalar(0.0))
+            val out = Mat(); Core.multiply(anc, Scalar(DIM, DIM, DIM, 1.0), out)
+            anc.copyTo(out, foot)
+            if (boost) Core.add(out, Scalar(0.0, BOOST, 0.0, 0.0), out, d)
+            Imgproc.rectangle(out, Point(0.0, 0.0), Point(CANVAS - 1.0, CANVAS - 1.0), Scalar(255.0, 160.0, 0.0, 255.0), 3)
             fun map(x: Double, y: Double) = Point(A[0] * x + A[1] * y + A[2], A[3] * x + A[4] * y + A[5])
             val fw = frame.width.toDouble(); val fh = frame.height.toDouble()
             val outline = listOf(MatOfPoint(map(0.0, 0.0), map(fw, 0.0), map(fw, fh), map(0.0, fh)))
-            val yellow = Scalar(255.0, 255.0, 0.0, 255.0)
-            Imgproc.polylines(ov, outline, true, yellow, 3); Imgproc.polylines(om, outline, true, Scalar(255.0), 3)
-            for (d in dets) {
-                val ps = listOf(map(d.x0 * fw, d.y0 * fh), map(d.x1 * fw, d.y0 * fh), map(d.x0 * fw, d.y1 * fh), map(d.x1 * fw, d.y1 * fh))
+            Imgproc.polylines(out, outline, true, Scalar(255.0, 255.0, 0.0, 255.0), 3)
+            for (det in dets) {
+                val ps = listOf(map(det.x0 * fw, det.y0 * fh), map(det.x1 * fw, det.y0 * fh), map(det.x0 * fw, det.y1 * fh), map(det.x1 * fw, det.y1 * fh))
                 val p0 = Point(ps.minOf { it.x }, ps.minOf { it.y }); val p1 = Point(ps.maxOf { it.x }, ps.maxOf { it.y })
-                Imgproc.rectangle(ov, p0, p1, boxColor, 3); Imgproc.rectangle(om, p0, p1, Scalar(255.0), 3)
-                val org = Point(p0.x + 4, max(p0.y - 8, 20.0))
-                Imgproc.putText(ov, d.name, org, Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, boxColor, 2)
-                Imgproc.putText(om, d.name, org, Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255.0), 2)
+                Imgproc.rectangle(out, p0, p1, boxColor, 3)
+                Imgproc.putText(out, det.name, Point(p0.x + 4, max(p0.y - 8, 20.0)), Imgproc.FONT_HERSHEY_SIMPLEX, 0.8, boxColor, 2)
             }
-            val ovW = roll(ov, wx, wy); val omW = roll(om, wx, wy)
-            ovW.copyTo(out, omW)
-            val tag = "world ($wx,$wy)" + if (info.refresh) "  REFRESH" else ""
-            Imgproc.putText(out, tag, Point(12.0, CANVAS - 16.0), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0.0, 0.0, 0.0, 255.0), 5)
-            Imgproc.putText(out, tag, Point(12.0, CANVAS - 16.0), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255.0, 255.0, 255.0, 255.0), 2)
+            val outW = roll(out, world[0], world[1])
+            var tag = "world (${Math.floorMod(world[0], CANVAS)},${Math.floorMod(world[1], CANVAS)})"
+            if (info.gop > 0 && info.idx >= 0) tag += if (info.refresh) "  REFRESH" else "  refresh in ${info.gop - info.idx % info.gop}"
+            Imgproc.putText(outW, tag, Point(12.0, CANVAS - 16.0), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0.0, 0.0, 0.0, 255.0), 5)
+            Imgproc.putText(outW, tag, Point(12.0, CANVAS - 16.0), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255.0, 255.0, 255.0, 255.0), 2)
 
-            val small = Mat(); Imgproc.resize(out, small, Size(outSide.toDouble(), outSide.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            val small = Mat(); Imgproc.resize(outW, small, Size(outSide.toDouble(), outSide.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
             val bmp = Bitmap.createBitmap(outSide, outSide, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(small, bmp)
-            for (m in listOf(f, am, layer, ones, foot, footW, layerW, out, ov, om, ovW, omW, small)) m.release()
+            for (m in listOf(f, am, target, d, ones, foot, out, outW, small)) m.release()
             outline.forEach { it.release() }
             return bmp
         }
 
         companion object {
-            private const val DIM = 0.45
-            private const val GRID_STEP = 128
+            private const val DIM = 0.6
 
             /** dst[(y+dy)%h, (x+dx)%w] = src[y, x]  (np.roll(src, (dy, dx), axis=(0, 1))) */
             fun roll(src: Mat, dx: Int, dy: Int): Mat {

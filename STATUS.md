@@ -101,15 +101,18 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
   per-pixel lookup (0 mismatches / 38 frames). A refresh (GOP) frame is all green.
   App: checkbox "재연산 패치 초록 표시" / `--ez boost false`; sim: `--no-boost`; server global view:
   `--no-boost` or dashboard button / `POST /v1/vis?boost=0`.
-- **Shared global coordinate view** (wrap-around torus). Server returns `world` = cumulative roll of the
-  canvas (mod 1024) and `world_reset`; on a GOP refresh it registers the new frame once against the outgoing
-  anchor (~5 ms, refresh frames only) so the map stays continuous. Mosaic = each frame painted at
-  canvas+world; outline/boxes drawn in canvas coords then rolled, so they wrap too.
+- **Shared global coordinate view** (wrap-around), as upstream draws it (offload/server.py result
+  thread, on_device/evaluate_imvid.py): the *anchor canvas* (the image whose cached features are reused)
+  rolled by the cumulative shift `world` (server response field; = upstream cum_shift). The anchor is rebuilt
+  from a centred frame at every refresh (GOP 20 ≈ 2.5 s at 8 FPS), so the view refreshes with it; `world`
+  is never reset, so the seam (orange line = canvas edge) keeps its place. Current frame outlined in yellow,
+  stale anchor content dimmed, "refresh in N" countdown.
   - Server: rendered off the request path (≤10 Hz) → `GET /v1/world.jpg`; dashboard Ouroboros lane
     "폰 화면 / 서버 global 좌표" switch. `--no-world-vis` / `POST /v1/vis?world=0` to disable.
-  - App: checkbox "global 좌표 보기" / `--ez world true`; rendered on its own thread, not in e2e
-    (Pixel: still 8.0 FPS, 96 ms).
-  - Synthetic 14 px/frame pan: world step 14.0 ± 0.5 px per frame, continuous across every refresh, wraps.
+  - App: checkbox "global 좌표 보기" / `--ez world true`. The phone keeps its own copy of the anchor from
+    the responses (refresh → centred frame, else roll by -shift and copy recomputed patches), so it must see
+    every frame: composited in order on its own thread, only the newest drawn; turned on mid-run it starts
+    at the next refresh. Not in e2e.
 - Finding: on the 40-frame bear clip (loops), upstream rigid registration sometimes returns garbage
   (e.g. 83° rotation after a GOP): `estimate_affine_in_padded_anchor_fast(mode="rigid")` normalises the
   LMEDS scale away, so a degenerate fit becomes a full-size rotation and the scale<0.95 refresh check never

@@ -56,7 +56,7 @@ from aiohttp import web  # noqa: E402
 
 sys.path.insert(0, str(HERE))
 from coco import COCO  # noqa: E402
-from vis import WorldMosaic, canvas_footprint  # noqa: E402
+from vis import WorldView as AnchorWorldView, canvas_footprint  # noqa: E402
 from preprocessing import (  # noqa: E402
     shift_anchor_features, apply_affine_and_pad, get_padded_image,
     estimate_affine_in_padded_anchor_fast, create_dirtiness_map,
@@ -439,31 +439,10 @@ def process(body, mode, thres, reset):
             target = get_padded_image(frame_bgr, INPUT_SIZE, filling_color=PAD_COLOR)
             dmap = torch.ones(1, GRID, GRID, 1, device=device)
             shift = (0, 0)
-        # ---- shared global coordinate: where this canvas sits on the torus ----
-        world_reset = False
-        if mode == "ouroboros":
-            if not refresh:
-                s.world = [(s.world[0] + shift[0]) % INPUT_SIZE[0], (s.world[1] + shift[1]) % INPUT_SIZE[1]]
-            else:
-                # a GOP refresh re-centres the frame on a fresh canvas; register it once against
-                # the outgoing anchor so the world map stays continuous across the refresh
-                delta = None
-                if reason == "gop" and s.anchor_image is not None:
-                    t_w = time.perf_counter()
-                    try:
-                        cv2.setRNGSeed(REG_RNG_SEED)
-                        A = estimate_affine_in_padded_anchor_fast(s.anchor_image, frame_bgr, mode=registration_mode)
-                    except cv2.error:
-                        A = None
-                    if A is not None and np.linalg.norm(A[:2, :2]) >= 0.95:
-                        c0 = np.array([INPUT_SIZE[0] / 2, INPUT_SIZE[1] / 2])
-                        old = A[:, :2] @ (c0 - np.array(offset)) + A[:, 2]   # new-canvas centre in old canvas
-                        delta = np.rint(old - c0).astype(int)
-                    tm["register"] += (time.perf_counter() - t_w) * 1000; t = time.perf_counter()
-                if delta is None:
-                    s.world, world_reset = [0, 0], True
-                else:
-                    s.world = [int(s.world[0] + delta[0]) % INPUT_SIZE[0], int(s.world[1] + delta[1]) % INPUT_SIZE[1]]
+        # ---- shared global coordinate: cumulative wrap-around shift (upstream cum_shift) ----
+        # Not reset at a refresh -- the anchor is, so the global view refreshes with it.
+        if mode == "ouroboros" and not refresh:
+            s.world = [(s.world[0] + shift[0]) % INPUT_SIZE[0], (s.world[1] + shift[1]) % INPUT_SIZE[1]]
         dmap_np = dmap[0, :, :, 0].cpu().numpy() > 0
         n_dirty = int(dmap_np.sum())
         # The phone's mirror advances its copy of the anchor with exactly this map
@@ -525,11 +504,11 @@ def process(body, mode, thres, reset):
             "names": [COCO[int(x)] if 0 <= int(x) < len(COCO) else str(int(x)) for x in labels.tolist()],
             "timing": {k: round(v, 3) for k, v in tm.items()},
             "dmap": dmap_bits,
-            "world": list(s.world) if mode == "ouroboros" else None, "world_reset": world_reset,
+            "world": list(s.world) if mode == "ouroboros" else None,
         }
         if mode == "ouroboros" and vis_cfg["world"]:
-            world_view.submit(target, (h, w), None if refresh else affine, offset, dmap_np, list(s.world),
-                              cboxes, resp["names"], refresh, world_reset)
+            world_view.submit(s.anchor_image.copy(), (h, w), None if refresh else affine, offset, dmap_np,
+                              list(s.world), cboxes, resp["names"], refresh, s.frame_idx)
         s.frame_idx += 1
         return resp
 
@@ -539,20 +518,18 @@ vis_cfg = {"world": True, "boost": True}   # --no-world-vis / --no-boost, or POS
 
 
 class WorldView:
-    """Renders the Ouroboros session's toroidal world mosaic off the request path
+    """Renders the Ouroboros session's anchor canvas in global coordinates off the request path
     (one worker, latest frame wins) and tells dashboards a new image is ready."""
     MAX_HZ = 10.0
 
     def __init__(self):
-        self.mosaic = WorldMosaic()
-        self.lock = threading.Lock(); self.busy = False; self.pending = None; self.need_reset = False
+        self.view = AnchorWorldView()
+        self.lock = threading.Lock(); self.busy = False; self.pending = None
         self.jpeg, self.v, self.last = None, 0, 0.0
         self.loop = None
 
     def submit(self, *job):
         with self.lock:
-            if job[-1]:
-                self.need_reset = True        # never drop a discontinuity
             self.pending = job
             if self.busy:
                 return
@@ -563,13 +540,12 @@ class WorldView:
         while True:
             with self.lock:
                 job, self.pending = self.pending, None
-                reset, self.need_reset = self.need_reset, False
                 if job is None:
                     self.busy = False; return
-            target, hw, affine, offset, dmap_np, world, cboxes, names, refresh, _ = job
+            anchor, hw, affine, offset, dmap_np, world, cboxes, names, refresh, idx = job
             foot = canvas_footprint(hw, affine, offset)
-            img = self.mosaic.update(target, foot, dmap_np, world, cboxes, names, boost=vis_cfg["boost"],
-                                     refresh=refresh, reset=reset)
+            img = self.view.render(anchor, foot, dmap_np, world, cboxes, names, boost=vis_cfg["boost"],
+                                   refresh=refresh, frame_idx=idx, gop=gop)
             now = time.time()
             if now - self.last >= 1.0 / self.MAX_HZ:
                 self.last = now
@@ -579,9 +555,6 @@ class WorldView:
                 if self.loop:
                     self.loop.call_soon_threadsafe(_broadcast, "world", {"v": self.v})
 
-    def clear(self):
-        with self.lock:
-            self.need_reset = True
 
 
 world_view = WorldView()
@@ -665,7 +638,6 @@ async def reset(request):
     for m, s in sessions.items():
         if mode in (None, "dashboard", m):
             s.__init__()
-    world_view.clear()
     return web.json_response({"ok": True})
 
 
@@ -806,7 +778,7 @@ def main():
     ap.add_argument("--sched", default="fifo", choices=list(GpuScheduler.POLICIES),
                     help="GPU sharing between modes (switchable live from the dashboard / POST /v1/sched)")
     ap.add_argument("--no-world-vis", action="store_true",
-                    help="do not render the Ouroboros session on the shared global (toroidal) canvas")
+                    help="do not render the Ouroboros anchor canvas in shared global coordinates")
     ap.add_argument("--no-boost", action="store_true",
                     help="server-side views: do not tint recomputed patches green")
     args = ap.parse_args()

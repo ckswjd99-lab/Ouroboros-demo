@@ -49,60 +49,38 @@ def boost_recomputed(img_bgr, resp, amount=BOOST):
 
 # ---------------------------------------------------------------- shared global coordinate view
 #
-# Ouroboros keeps one 1024x1024 canvas that is a *torus*: when the camera pans, the anchor
-# (image + cached ViT features) is rolled by a whole number of patches instead of being
-# re-padded, so content that leaves one edge comes back in at the other. The world position of
-# the current canvas is therefore the cumulative roll  W = sum(shift) mod 1024  (the server
-# returns it as resp["world"]); a canvas pixel c sits at world pixel (c + W) mod 1024.
-# This mosaic paints every registered frame at its world position on that torus, so the frame
-# visibly moves over a fixed map and wraps around its edges.
+# Same as upstream (offload/server.py result thread, on_device/evaluate_imvid.py): the *anchor
+# canvas* -- exactly the 1024x1024 image whose cached ViT features the next frame reuses -- shown
+# rolled by the cumulative wrap-around shift, so content stays put while the canvas slides under it
+# and wraps at the edges. The anchor is rebuilt from a centred frame at every refresh (GOP, failed
+# registration, scale change), so the global view refreshes with it; the cumulative shift itself is
+# never reset (upstream keeps cum_shift too), so the seam keeps its place.
 
-class WorldMosaic:
-    DIM = 0.45                      # brightness of world content outside the current frame
-    GRID_STEP = 128
+class WorldView:
+    """Renders anchor canvas + current frame outline + recomputed patches + boxes, rolled by `world`."""
+    DIM = 0.6                       # anchor content outside the current frame (stale, still reused)
 
-    def __init__(self):
-        self.img = np.zeros((CANVAS, CANVAS, 3), np.uint8)
-        self.seen = np.zeros((CANVAS, CANVAS), bool)
-        self.n = 0
-
-    def clear(self):
-        self.img[:] = 0; self.seen[:] = False
-
-    def update(self, target, footprint, dmap_grid, world, boxes=(), names=(), boost=True,
-               color=(105, 240, 174), refresh=False, reset=False):
-        """target: canvas image (BGR, current canvas coords); footprint: bool canvas mask of the
-        frame; dmap_grid: bool 64x64 recomputed patches; boxes: canvas-space xyxy. Returns BGR."""
-        if reset:
-            self.clear()
+    def render(self, anchor, footprint, dmap_grid, world, boxes=(), names=(), boost=True,
+               color=(105, 240, 174), refresh=False, frame_idx=None, gop=None):
+        """anchor: canvas after this frame's composite (BGR); footprint: bool canvas mask of the current
+        frame; dmap_grid: bool 64x64 recomputed patches; boxes: canvas-space xyxy."""
         wx, wy = int(world[0]) % CANVAS, int(world[1]) % CANVAS
-        roll = lambda a: np.roll(a, shift=(wy, wx), axis=(0, 1))
-        fw = roll(footprint)
-        self.img[fw] = roll(target)[fw]; self.seen |= fw; self.n += 1   # the map keeps raw pixels
-
-        out = (self.img * self.DIM).astype(np.uint8)
-        out[fw] = self.img[fw]
-        if boost:   # only the current frame shows what was recomputed for it
+        out = (anchor * self.DIM).astype(np.uint8)
+        out[footprint] = anchor[footprint]
+        if boost:
             d = cv2.resize(dmap_grid.astype(np.uint8), (CANVAS, CANVAS), interpolation=cv2.INTER_NEAREST).astype(bool)
-            d = roll(d & footprint)
             g = out[:, :, 1]
             g[d] = np.minimum(g[d].astype(np.int16) + BOOST, 255).astype(np.uint8)
-        for v in range(0, CANVAS, self.GRID_STEP):         # fixed world grid (torus seams at 0)
-            c = (70, 70, 70) if v else (0, 160, 255)
-            cv2.line(out, (v, 0), (v, CANVAS - 1), c, 1); cv2.line(out, (0, v), (CANVAS - 1, v), c, 1)
-
-        # outline + boxes drawn in canvas coords, then rolled with the frame (so they wrap too)
-        ov = np.zeros_like(out); om = np.zeros((CANVAS, CANVAS), np.uint8)
+        cv2.rectangle(out, (0, 0), (CANVAS - 1, CANVAS - 1), (0, 160, 255), 3)    # canvas edge = wrap seam
         cs, _ = cv2.findContours(footprint.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        yellow = (0, 255, 255)
-        cv2.drawContours(ov, cs, -1, yellow, 3); cv2.drawContours(om, cs, -1, 255, 3)
+        cv2.drawContours(out, cs, -1, (0, 255, 255), 3)
         for (x0, y0, x1, y1), nm in zip(boxes, names):
-            p0, p1 = (int(x0), int(y0)), (int(x1), int(y1))
-            cv2.rectangle(ov, p0, p1, color, 3); cv2.rectangle(om, p0, p1, 255, 3)
-            org = (int(x0) + 4, max(int(y0) - 8, 20))
-            cv2.putText(ov, nm, org, 0, 0.8, color, 2); cv2.putText(om, nm, org, 0, 0.8, 255, 2)
-        om = roll(om).astype(bool); out[om] = roll(ov)[om]
-        tag = f"world ({wx},{wy})" + ("  REFRESH" if refresh else "")
+            cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), color, 3)
+            cv2.putText(out, nm, (int(x0) + 4, max(int(y0) - 8, 20)), 0, 0.8, color, 2)
+        out = np.roll(out, shift=(wy, wx), axis=(0, 1))
+        tag = f"world ({wx},{wy})"
+        if frame_idx is not None and gop:
+            tag += f"  refresh in {gop - frame_idx % gop}" if not refresh else "  REFRESH"
         cv2.putText(out, tag, (12, CANVAS - 16), 0, 1.0, (0, 0, 0), 5)
         cv2.putText(out, tag, (12, CANVAS - 16), 0, 1.0, (255, 255, 255), 2)
         return out

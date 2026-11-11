@@ -92,7 +92,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var worldOn = false       // show the shared global (toroidal) canvas instead of the frame
     private val worldView by lazy { RecomputeVis.WorldView() }
     private val visExec = Executors.newSingleThreadExecutor()
-    private val worldBusy = AtomicBoolean(false)
+    private val worldQueued = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var lastWorld: Bitmap? = null
     @Volatile private var resetNext = true
     private var mode = Mode.OUROBOROS
@@ -128,7 +128,12 @@ class MainActivity : AppCompatActivity() {
         btnStart = findViewById(R.id.btnStart)
         checkBoost = findViewById(R.id.checkBoost); checkWorld = findViewById(R.id.checkWorld)
         checkBoost.setOnCheckedChangeListener { _, on -> boostOn = on }
-        checkWorld.setOnCheckedChangeListener { _, on -> worldOn = on; if (on) worldView.clear() }
+        checkWorld.setOnCheckedChangeListener { _, on ->
+            worldOn = on
+            // the phone's copy of the anchor only stays exact if it sees every frame, so turning the
+            // view on mid-run resumes at the next refresh (<= one GOP)
+            if (on) { lastWorld = null; visExec.execute { worldView.clear() } }
+        }
 
         if (!OpenCVLoader.initLocal()) Log.e(TAG, "OpenCV init failed")
 
@@ -198,7 +203,7 @@ class MainActivity : AppCompatActivity() {
         }
         setControlsEnabled(false); btnStart.text = "정지"
         e2eHist.clear(); doneTimes.clear(); frameNo = 0; chart.clear(); errStats.clear()
-        resetNext = true; mirrorInSync = false; mirror.reset(); worldView.clear(); lastWorld = null
+        resetNext = true; mirrorInSync = false; mirror.reset(); lastWorld = null; visExec.execute { worldView.clear() }
         val m = mode
         val host = editServer.text.toString().trim().removePrefix("http://").trimEnd('/')
         val addr = if (host.contains(':')) host else "$host:${m.port}"   // explicit host:port overrides
@@ -369,17 +374,19 @@ class MainActivity : AppCompatActivity() {
         val info = if (m == Mode.OUROBOROS) RecomputeVis.Info(r.json) else null
         val vis = draw(frame, r.dets, m, if (boostOn) info else null)
         val showWorld = info != null && worldOn
-        // the global view is rendered off the critical path (latest frame wins), so it never
-        // changes the e2e latency being measured
-        if (showWorld && worldBusy.compareAndSet(false, true)) {
+        // The global view runs off the critical path, so it never changes the e2e latency being
+        // measured. Every frame updates the phone's anchor copy, in order; only the newest is drawn.
+        if (showWorld) {
             val dets = r.dets; val boost = boostOn; val col = m.color
+            worldQueued.incrementAndGet()
             visExec.execute {
+                val newest = worldQueued.decrementAndGet() == 0
                 try {
                     val wb = worldView.update(frame, info!!, dets,
-                        org.opencv.core.Scalar(Color.red(col).toDouble(), Color.green(col).toDouble(), Color.blue(col).toDouble(), 255.0), boost)
+                        org.opencv.core.Scalar(Color.red(col).toDouble(), Color.green(col).toDouble(), Color.blue(col).toDouble(), 255.0),
+                        boost, render = newest)
                     if (wb != null) { lastWorld = wb; ui { if (worldOn && mode == Mode.OUROBOROS) img.setImageBitmap(wb) } }
-                } catch (e: Exception) { Log.e(TAG, "world view failed", e) }
-                finally { worldBusy.set(false) }
+                } catch (e: Exception) { Log.e(TAG, "world view failed", e); worldView.clear() }
             }
         }
         val tDone = OffloadClient.nowMs()
@@ -449,7 +456,7 @@ class MainActivity : AppCompatActivity() {
             e2e, encMs, r.uploadMs, r.computeMs, r.downloadMs, r.nDirty, th, r.refresh,
             pend?.est?.totalMs?.let { "%.1f".format(it) } ?: "", pend?.pred?.nDirty?.toString() ?: "", jpeg.size))
         ui {
-            if (!showWorld) img.setImageBitmap(vis)
+            if (!showWorld || lastWorld == null) img.setImageBitmap(vis)   // until the view has synced
             setStatus(e2e); txtStats.text = stats
             if (m == Mode.OUROBOROS && predictOn) txtPredict.text = predText
         }
