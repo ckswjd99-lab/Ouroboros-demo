@@ -94,6 +94,17 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 - LMEDS RNG is seeded identically on both sides before registration (`REG_RNG_SEED`).
 - Dashboard 3-column desktop layout verified in headless Chromium (no console errors).
 
+## Prediction target: e2e or server compute only (2026-11-11)
+- Dashboard header "예측 대상 [e2e | 서버 연산만]" (`POST /v1/predict?target=e2e|compute`, `--pred-target`).
+  The server echoes `pred_target` in every `/v1/infer` response; the phone switches on its next frame.
+- compute = decode + registration + dirty map + ViT(n) + post (= server `timing.compute`, GPU wait excluded).
+  In compute mode the phone skips the GPU probe; stats for each target are kept separately (`c_mae`,
+  `c_w10`, ... in the report), and what-if rows carry both e2e and compute.
+- Dashboard: prediction card, what-if table, breakdown and timeline (dashed predicted vs solid actual server
+  compute) follow the selected target.
+- Pixel alone on MIG, 100 frames: compute MAE 2.5 ms, bias +0.1, 94% within ±10%, 99% within ±20%
+  (e2e on the same run: MAE 11.8 ms, 67% / 94%).
+
 ## Visualisation options (2026-11-10)
 - **Recomputed-patch green boost** (default ON; upstream's `img[...,1] = clip(img[...,1] + dmap*30, 0, 255)`).
   Drawn on the camera frame: each frame pixel looks its patch up through the server's affine

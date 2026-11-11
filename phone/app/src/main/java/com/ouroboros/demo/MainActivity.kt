@@ -103,6 +103,9 @@ class MainActivity : AppCompatActivity() {
     private val mirror by lazy { OuroborosMirror() }   // after OpenCVLoader.initLocal() in onCreate
     private val predictor = LatencyPredictor()
     private val errStats = LatencyPredictor.ErrorStats()
+    private val errCompute = LatencyPredictor.ErrorStats()   // compute-only prediction vs server compute
+    /** What to predict, chosen on the dashboard ("e2e" or "compute"); the server echoes it in every response. */
+    @Volatile private var predTarget = "e2e"
     private var mirrorInSync = false
 
     private val whatIf = listOf(5, 10, 20, 30, 50, 80)
@@ -148,7 +151,7 @@ class MainActivity : AppCompatActivity() {
             predictOn = on
             // The mirror only tracks the server's anchor while it runs, so
             // (re)enabling it forces a server-side refresh to resync both.
-            if (on) { resetNext = true; mirrorInSync = false; errStats.clear() }
+            if (on) { resetNext = true; mirrorInSync = false; errStats.clear(); errCompute.clear() }
             txtPredict.visibility = if (on) View.VISIBLE else View.GONE
         }
         radioMode.setOnCheckedChangeListener { _, id -> mode = modeFor(id); updateModeUi() }
@@ -191,7 +194,8 @@ class MainActivity : AppCompatActivity() {
                 LatencyChartView.Series("server compute", Color.rgb(105, 240, 174)))
             Mode.OUROBOROS -> chart.setSeries(LatencyChartView.Series("e2e", Color.CYAN),
                 LatencyChartView.Series("server compute", Color.rgb(105, 240, 174)),
-                LatencyChartView.Series("predicted e2e", Color.rgb(255, 183, 77), dashed = true))
+                LatencyChartView.Series("pred e2e", Color.rgb(255, 183, 77), dashed = true),
+                LatencyChartView.Series("pred compute", Color.rgb(206, 147, 216), dashed = true))
         }
     }
 
@@ -202,7 +206,7 @@ class MainActivity : AppCompatActivity() {
             permLauncher.launch(Manifest.permission.CAMERA); return
         }
         setControlsEnabled(false); btnStart.text = "정지"
-        e2eHist.clear(); doneTimes.clear(); frameNo = 0; chart.clear(); errStats.clear()
+        e2eHist.clear(); doneTimes.clear(); frameNo = 0; chart.clear(); errStats.clear(); errCompute.clear()
         resetNext = true; mirrorInSync = false; mirror.reset(); lastWorld = null; visExec.execute { worldView.clear() }
         val m = mode
         val host = editServer.text.toString().trim().removePrefix("http://").trimEnd('/')
@@ -328,8 +332,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private class Pending(val pred: OuroborosMirror.Prediction, val est: LatencyPredictor.Estimate,
-                          val whatIfEst: List<Triple<Int, Int, Double>>, val readyAtMs: Double,
-                          val probe: OffloadClient.GpuProbe?)
+                          val whatIfEst: List<Triple<Int, Int, Double>>, val whatIfCompute: List<Double>,
+                          val readyAtMs: Double, val probe: OffloadClient.GpuProbe?, val target: String)
 
     private fun processOffload(frame: Bitmap) {
         val c = client!!
@@ -351,7 +355,9 @@ class MainActivity : AppCompatActivity() {
         // how many patches the server will recompute, the probe asks how much GPU work other
         // phones still have queued there.
         val doPredict = wantPredict && mirrorInSync
-        val probeFut: Future<OffloadClient.GpuProbe?>? = if (doPredict) probeExec.submit<OffloadClient.GpuProbe?> {
+        val target = predTarget
+        // compute-only prediction needs no network or GPU-queue model, so no probe either
+        val probeFut: Future<OffloadClient.GpuProbe?>? = if (doPredict && target == "e2e") probeExec.submit<OffloadClient.GpuProbe?> {
             try { c.gpuProbe() } catch (e: Exception) { null }
         } else null
         val fut: Future<Pending>? = if (doPredict) mirrorExec.submit<Pending> {
@@ -359,14 +365,18 @@ class MainActivity : AppCompatActivity() {
             val probe = try { probeFut?.get(300, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (e: Exception) { null }
             val est: LatencyPredictor.Estimate
             val wi: List<Triple<Int, Int, Double>>
+            val wic: List<Double>
             synchronized(predictor) {
                 est = predictor.estimate(p.nDirty, p.refresh, kb, encMs, probe)
-                wi = p.whatIf.map { (t, n) -> Triple(t, n,
-                    predictor.estimate(n, p.refresh, kb, encMs, probe).totalMs) }
+                val ests = p.whatIf.map { (_, n) -> predictor.estimate(n, p.refresh, kb, encMs, probe) }
+                wi = p.whatIf.zip(ests) { (t, n), e -> Triple(t, n, e.totalMs) }
+                wic = ests.map { it.computeMs }
             }
             val ready = OffloadClient.nowMs() - t0
-            ui { txtStatus.text = "#${frameNo + 1} 전송 중… 예측 도착 +%.0f ms (예측 완료 +%.0f ms)".format(est.totalMs, ready) }
-            Pending(p, est, wi, ready, probe)
+            ui { txtStatus.text = if (target == "compute")
+                    "#${frameNo + 1} 전송 중… 서버 연산 예측 %.0f ms (예측 완료 +%.0f ms)".format(est.computeMs, ready)
+                 else "#${frameNo + 1} 전송 중… 예측 도착 +%.0f ms (예측 완료 +%.0f ms)".format(est.totalMs, ready) }
+            Pending(p, est, wi, wic, ready, probe, target)
         } else null
 
         val r = c.infer(jpeg, modeStr, th, reset)
@@ -393,6 +403,7 @@ class MainActivity : AppCompatActivity() {
         val e2e = tDone - t0
         val clientPost = tDone - tPost0
         r.json.optInt("gop", 0).takeIf { it > 0 }?.let { mirror.gop = it }
+        r.json.optString("pred_target", "").takeIf { it == "e2e" || it == "compute" }?.let { predTarget = it }
 
         val pend = try { fut?.get() } catch (e: Exception) { Log.e(TAG, "mirror failed", e); mirrorInSync = false; null }
         // The result is in hand: let the camera thread grab and convert the next frame while
@@ -409,7 +420,9 @@ class MainActivity : AppCompatActivity() {
             mirrorExec.execute { mirror.commit(refresh, sAff, sShift, sDmap) }
             affDiff = if (sAff != null && pend.pred.affine != null)
                 sAff.indices.maxOf { kotlin.math.abs(sAff[it] - pend.pred.affine[it]) } else Double.NaN
-            errStats.add(pend.est.totalMs, e2e, pend.pred.nDirty, r.nDirty)
+            // e2e estimates made without the GPU probe (compute target) would skew the e2e stats
+            if (pend.target == "e2e") errStats.add(pend.est.totalMs, e2e, pend.pred.nDirty, r.nDirty)
+            errCompute.add(pend.est.computeMs, r.computeMs, pend.pred.nDirty, r.nDirty)
         }
         if (m == Mode.OUROBOROS) synchronized(predictor) {
             val tm = r.timing
@@ -421,7 +434,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         recordFrame(e2e)
-        chart.add(e2e.toFloat(), r.computeMs.toFloat(), pend?.est?.totalMs?.toFloat() ?: Float.NaN)
+        chart.add(e2e.toFloat(), r.computeMs.toFloat(),
+            pend?.takeIf { it.target == "e2e" }?.est?.totalMs?.toFloat() ?: Float.NaN,
+            pend?.takeIf { it.target == "compute" }?.est?.computeMs?.toFloat() ?: Float.NaN)
         val t = r.timing
         val stats = buildString {
             append(commonStats())
@@ -434,7 +449,21 @@ class MainActivity : AppCompatActivity() {
                 r.nDirty, 100.0 * r.nDirty / 4096, if (r.refresh) " [refresh: ${r.json.optString("refresh_reason")}]" else "",
                 kb, r.dets.size))
         }
-        val predText = if (pend != null) buildString {
+        val predText = if (pend != null && pend.target == "compute") buildString {
+            val err = r.computeMs - pend.est.computeMs
+            append("[서버 연산만 예측] 예측 %.0f ms → 실제 %.0f ms (오차 %+.0f ms, %+.0f%%)\n".format(
+                pend.est.computeMs, r.computeMs, err, 100 * err / r.computeMs))
+            append("  예측 시점: 전송 시작 후 +%.0f ms (mirror %.1f ms) · 네트워크/GPU 대기 제외\n".format(pend.readyAtMs, pend.pred.ms))
+            append("  재연산 패치: 예측 %d / 실제 %d%s\n".format(pend.pred.nDirty, r.nDirty,
+                if (pend.pred.refresh != r.refresh) "  (refresh 불일치)" else ""))
+            if (errCompute.count > 0) append("누적(최근 %d): MAE %.1f ms, bias %+.1f ms, ±10%% 이내 %.0f%%, ±20%% 이내 %.0f%%\n".format(
+                errCompute.count, errCompute.mae(), errCompute.bias(), 100 * errCompute.within(0.1), 100 * errCompute.within(0.2)))
+            if (errCompute.count > 0) append("  패치 수 예측: MAE %.1f, 정확 일치 %.0f%%\n".format(errCompute.nMae(), 100 * errCompute.nExact()))
+            synchronized(predictor) { append(predictor.computeModelText()).append('\n') }
+            append("what-if (이 프레임, threshold별 서버 연산):\n")
+            for ((i, w) in pend.whatIfEst.withIndex()) append("  thr %3d → %4d patches → %6.0f ms%s\n".format(
+                w.first, w.second, pend.whatIfCompute[i], if (w.first == th) "  ◀" else ""))
+        } else if (pend != null) buildString {
             val err = e2e - pend.est.totalMs
             append("이번 프레임: 예측 %.0f ms → 실제 %.0f ms (오차 %+.0f ms, %+.0f%%)\n".format(
                 pend.est.totalMs, e2e, err, 100 * err / e2e))
@@ -468,8 +497,12 @@ class MainActivity : AppCompatActivity() {
         rec.put("predict_on", m == Mode.OUROBOROS && predictOn)
         rec.put("boost", info != null && boostOn).put("world_view", showWorld)
         if (pend != null) {
-            val wi = JSONArray(); pend.whatIfEst.forEach { (wt, n, ms) -> wi.put(JSONArray().put(wt).put(n).put(ms)) }
+            val wi = JSONArray(); pend.whatIfEst.forEachIndexed { i, (wt, n, ms) ->
+                wi.put(JSONArray().put(wt).put(n).put(ms).put(pend.whatIfCompute[i])) }
             rec.put("pred", J()
+                .put("target", pend.target).put("compute_est", pend.est.computeMs)
+                .put("c_mae", errCompute.mae()).put("c_bias", errCompute.bias()).put("c_w10", errCompute.within(0.1))
+                .put("c_w20", errCompute.within(0.2)).put("c_count", errCompute.count)
                 .put("est", pend.est.totalMs).put("ready_at", pend.readyAtMs).put("mirror_ms", pend.pred.ms)
                 .put("n_pred", pend.pred.nDirty).put("refresh_pred", pend.pred.refresh)
                 .put("gpu_others", pend.probe?.busyRemainingMs ?: Double.NaN).put("sched", pend.probe?.sched).put("probe_rtt", pend.probe?.rttMs ?: Double.NaN)

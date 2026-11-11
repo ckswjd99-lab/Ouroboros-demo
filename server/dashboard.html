@@ -98,6 +98,10 @@
       GPU 스케줄링
       <button data-pol="fifo" id="polFifo">FIFO</button><button data-pol="fair" id="polFair">Fair-share</button>
     </span>
+    <span class="sched" title="Ouroboros 폰이 무엇을 예측할지: e2e(인코딩+네트워크+GPU 대기+서버 연산) 또는 서버 연산만(GPU 대기 제외)">
+      예측 대상
+      <button data-tgt="e2e" id="tgtE2e">e2e</button><button data-tgt="compute" id="tgtComp">서버 연산만</button>
+    </span>
     <span class="spacer"></span>
     <button id="resetBtn" title="대시보드 기록만 초기화 (앱/서버 동작에는 영향 없음)">기록 초기화</button>
   </header>
@@ -112,7 +116,8 @@
         <span><i style="background:var(--ondevice)"></i>On-device</span>
         <span><i style="background:var(--naive)"></i>Naive offload</span>
         <span><i style="background:var(--ouroboros)"></i>Ouroboros</span>
-        <span><i style="background:repeating-linear-gradient(90deg,var(--pred) 0 5px,transparent 5px 8px)"></i>Ouroboros 예측 e2e</span>
+        <span id="lgPred"><i style="background:repeating-linear-gradient(90deg,var(--pred) 0 5px,transparent 5px 8px)"></i>Ouroboros 예측 e2e</span>
+        <span id="lgComp" class="hidden"><i style="background:#2e7d5b"></i>Ouroboros 실제 서버 연산</span>
       </div>
     </div>
     <div class="card">
@@ -128,7 +133,7 @@
   </div>
 
   <div class="card pred hidden" id="predCard">
-    <h2>Ouroboros e2e latency 예측 — 모바일이 재연산 패치 수를 병렬로 계산해서, 결과 도착 전에 예측</h2>
+    <h2 id="pTitle">Ouroboros e2e latency 예측 — 모바일이 재연산 패치 수를 병렬로 계산해서, 결과 도착 전에 예측</h2>
     <div class="predbig">
       <div><div class="l">예측</div><div class="v" id="pEst" style="color:var(--pred)">—</div></div>
       <div><div class="l">실제</div><div class="v" id="pAct">—</div></div>
@@ -148,7 +153,7 @@
         <table class="wi" id="wiTable"></table>
       </div>
       <div>
-        <div class="muted" style="margin-bottom:6px">예측 분해 (ms)</div>
+        <div class="muted" style="margin-bottom:6px" id="pBarTitle">예측 분해 (ms)</div>
         <div class="bar" id="pBar" style="height:20px"></div>
         <div class="barlabels" id="pLabels"></div>
       </div>
@@ -194,16 +199,20 @@ function connect() {
   const es = new EventSource("v1/events");
   es.addEventListener("open", () => { $("dot").classList.add("on"); $("connText").textContent = "실시간"; });
   es.addEventListener("error", () => { $("dot").classList.remove("on"); $("connText").textContent = "재연결 중…"; });
-  es.addEventListener("snapshot", e => { const d = JSON.parse(e.data); hist = d.history.map(norm); visCfg = d.vis || visCfg; worldV = d.world_v || 0; clockSkew = d.now - Date.now(); dirty = true; });
+  es.addEventListener("snapshot", e => { const d = JSON.parse(e.data); hist = d.history.map(norm); visCfg = d.vis || visCfg; predCfg = d.pred || predCfg; worldV = d.world_v || 0; clockSkew = d.now - Date.now(); dirty = true; });
   es.addEventListener("frame", e => { hist.push(norm(JSON.parse(e.data))); if (hist.length > 900) hist.shift(); dirty = true; });
   es.addEventListener("server", e => { server = JSON.parse(e.data); clockSkew = server.now - Date.now(); dirty = true; });
   es.addEventListener("reset", () => { hist = []; dirty = true; });
   es.addEventListener("world", e => { worldV = JSON.parse(e.data).v; dirty = true; });
   es.addEventListener("vis", e => { visCfg = JSON.parse(e.data); dirty = true; });
+  es.addEventListener("predcfg", e => { predCfg = JSON.parse(e.data); dirty = true; });
 }
 $("resetBtn").onclick = () => fetch("v1/dashboard/reset", { method: "POST" });
-for (const b of document.querySelectorAll(".sched button"))
+for (const b of document.querySelectorAll(".sched button[data-pol]"))
   b.onclick = () => fetch("v1/sched?policy=" + b.dataset.pol, { method: "POST" });
+let predCfg = { target: "e2e" };
+for (const b of document.querySelectorAll(".sched button[data-tgt]"))
+  b.onclick = () => fetch("v1/predict?target=" + b.dataset.tgt, { method: "POST" });
 setInterval(() => { dirty = true; }, 1000);
 // Ouroboros lane: the phone's own view, or the server's render of the shared global (toroidal) canvas
 let ouroView = "phone", worldV = 0, worldShown = -1, visCfg = { world: true, boost: true };
@@ -223,6 +232,10 @@ function render() {
   $("gpuPill").textContent = server ? `GPU 사용률 ${fmt(100 * server.gpu_util)}%` : "GPU —";
   const pol = server?.sched;
   $("polFifo").classList.toggle("on", pol === "fifo"); $("polFair").classList.toggle("on", pol === "fair");
+  $("tgtE2e").classList.toggle("on", predCfg.target === "e2e"); $("tgtComp").classList.toggle("on", predCfg.target === "compute");
+  const comp = predCfg.target === "compute";
+  $("lgPred").lastChild.textContent = comp ? "Ouroboros 예측 서버 연산" : "Ouroboros 예측 e2e";
+  $("lgComp").classList.toggle("hidden", !comp);
 }
 
 function renderLane(k, now) {
@@ -304,26 +317,39 @@ function renderPred() {
   if (!r || !r.predict_on) return;
   const p = r.pred, o = r.offload;
   if (!p) { $("pWhen").textContent = "서버와 anchor 동기화 중…"; return; }
-  const err = r.e2e - p.est;
-  $("pEst").textContent = `${fmt(p.est)} ms`; $("pAct").textContent = `${fmt(r.e2e)} ms`;
+  // what the phone actually predicted for this frame (follows the dashboard choice one frame later)
+  const comp = p.target === "compute";
+  $("pTitle").textContent = comp
+    ? "Ouroboros 서버 연산 시간 예측 — 네트워크·GPU 대기 제외, 모바일이 재연산 패치 수를 병렬로 계산해서 예측"
+    : "Ouroboros e2e latency 예측 — 모바일이 재연산 패치 수를 병렬로 계산해서, 결과 도착 전에 예측";
+  const est = comp ? p.compute_est : p.est, act = comp ? o?.compute : r.e2e;
+  const err = act - est;
+  $("pEst").textContent = `${fmt(est)} ms`; $("pAct").textContent = `${fmt(act)} ms`;
   $("pErr").textContent = `${err >= 0 ? "+" : ""}${fmt(err)} ms`;
-  $("pErr").style.color = Math.abs(err) / r.e2e <= 0.1 ? "#69f0ae" : Math.abs(err) / r.e2e <= 0.2 ? "#ffd54f" : "#ff8a80";
+  $("pErr").style.color = Math.abs(err) / act <= 0.1 ? "#69f0ae" : Math.abs(err) / act <= 0.2 ? "#ffd54f" : "#ff8a80";
   $("pReady").textContent = `+${fmt(p.ready_at)} ms`;
   $("pWhen").innerHTML = `전송 시작 후 이 시점에 예측 확정 (모바일 mirror ${fmt(p.mirror_ms, 1)} ms)<br>재연산 패치 예측 ${p.n_pred} / 서버 실제 ${o ? o.n_dirty : "—"}<br>` +
-    `GPU 대기 예측 ${fmt(p.gpu_wait_pred, 0)} / 실제 ${fmt(o?.timing?.gpu_wait, 0)} ms (probe: 다른 기기 GPU 잔여 ${fmt(p.gpu_others, 0)} ms)`;
-  $("pCount").textContent = `최근 ${p.count}프레임`;
-  $("pMae").textContent = `${fmt(p.mae, 1)} ms`; $("pBias").textContent = `${p.bias >= 0 ? "+" : ""}${fmt(p.bias, 1)} ms`;
-  $("pW10").textContent = `${fmt(100 * p.w10)}%`; $("pW20").textContent = `${fmt(100 * p.w20)}%`;
+    (comp ? `서버 연산 = 디코드·정합·dirty map + ViT + 후처리 (GPU 대기 ${fmt(o?.timing?.gpu_wait, 0)} ms 제외, probe 미사용)`
+          : `GPU 대기 예측 ${fmt(p.gpu_wait_pred, 0)} / 실제 ${fmt(o?.timing?.gpu_wait, 0)} ms (probe: 다른 기기 GPU 잔여 ${fmt(p.gpu_others, 0)} ms)`);
+  const st = comp ? { count: p.c_count, mae: p.c_mae, bias: p.c_bias, w10: p.c_w10, w20: p.c_w20 } : p;
+  $("pCount").textContent = `최근 ${st.count}프레임`;
+  $("pMae").textContent = `${fmt(st.mae, 1)} ms`; $("pBias").textContent = `${st.bias >= 0 ? "+" : ""}${fmt(st.bias, 1)} ms`;
+  $("pW10").textContent = `${fmt(100 * st.w10)}%`; $("pW20").textContent = `${fmt(100 * st.w20)}%`;
   $("pNMae").textContent = fmt(p.n_mae, 1); $("pNEx").textContent = `${fmt(100 * p.n_exact)}%`;
-  const maxMs = Math.max(...p.what_if.map(w => w[2]));
-  $("wiTable").innerHTML = "<tr><th>thr</th><th>패치</th><th>예측 e2e</th><th></th></tr>" + p.what_if.map(([t, n, ms]) =>
-    `<tr class="${o && t === o.thres ? "sel" : ""}"><td>${t}</td><td>${n}</td><td>${fmt(ms)} ms</td>` +
-    `<td style="width:38%"><div class="track"><div class="fill" style="width:${100 * ms / maxMs}%"></div></div></td></tr>`).join("");
-  const pp = p.parts;
-  stackBar($("pBar"), $("pLabels"), [["인코딩", pp.encode, "var(--enc)"], ["네트워크", pp.network, "var(--up)"],
-    ["GPU 대기", pp.gpu_wait, "var(--wait)"], ["서버 연산", pp.compute, "var(--srv)"],
-    ["기타", (pp.server_overhead || 0) + (pp.post || 0), "var(--draw)"]]);
-  $("pModels").innerHTML = `${p.compute_model}<br>${p.network_model}`;
+  const wv = w => comp ? w[3] : w[2];
+  const maxMs = Math.max(...p.what_if.map(wv));
+  $("wiTable").innerHTML = `<tr><th>thr</th><th>패치</th><th>${comp ? "예측 서버 연산" : "예측 e2e"}</th><th></th></tr>` + p.what_if.map(w =>
+    `<tr class="${o && w[0] === o.thres ? "sel" : ""}"><td>${w[0]}</td><td>${w[1]}</td><td>${fmt(wv(w))} ms</td>` +
+    `<td style="width:38%"><div class="track"><div class="fill" style="width:${100 * wv(w) / maxMs}%"></div></div></td></tr>`).join("");
+  const pp = p.parts, tm = o?.timing || {};
+  stackBar($("pBar"), $("pLabels"), comp
+    ? [["전처리(디코드·정합·dirty)", (tm.decode || 0) + (tm.register || 0) + (tm.dirty || 0), "#5c6bc0"],
+       ["ViT", tm.model, "var(--srv)"], ["후처리", tm.post, "var(--draw)"]]
+    : [["인코딩", pp.encode, "var(--enc)"], ["네트워크", pp.network, "var(--up)"],
+       ["GPU 대기", pp.gpu_wait, "var(--wait)"], ["서버 연산", pp.compute, "var(--srv)"],
+       ["기타", (pp.server_overhead || 0) + (pp.post || 0), "var(--draw)"]]);
+  $("pBarTitle").textContent = comp ? "실제 서버 연산 분해 (ms)" : "예측 분해 (ms)";
+  $("pModels").innerHTML = comp ? p.compute_model : `${p.compute_model}<br>${p.network_model}`;
 }
 
 function setupCanvas(c) {
@@ -358,9 +384,16 @@ function drawTimeline(now) {
     g.beginPath(); xs.forEach((r, i) => { const px = x(r.server_t), py = y(r.e2e); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
     if (k === "ondevice") xs.forEach(r => { g.beginPath(); g.arc(x(r.server_t), y(r.e2e), 4, 0, 7); g.fill(); });
   }
-  const ps = data.filter(r => r.mode === "ouroboros" && r.pred);
+  // prediction line: e2e, or server compute (then with the actual server compute next to it)
+  const comp = predCfg.target === "compute";
+  const ps = data.filter(r => r.mode === "ouroboros" && r.pred && (r.pred.target || "e2e") === predCfg.target);
+  if (comp) {
+    const cs = data.filter(r => r.mode === "ouroboros" && r.offload);
+    g.strokeStyle = "#2e7d5b"; g.lineWidth = 1.8;
+    g.beginPath(); cs.forEach((r, i) => { const px = x(r.server_t), py = y(r.offload.compute); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
+  }
   g.strokeStyle = "#ffb74d"; g.lineWidth = 1.8; g.setLineDash([6, 4]);
-  g.beginPath(); ps.forEach((r, i) => { const px = x(r.server_t), py = y(r.pred.est); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
+  g.beginPath(); ps.forEach((r, i) => { const px = x(r.server_t), py = y(comp ? r.pred.compute_est : r.pred.est); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
   g.setLineDash([]); g.restore();
   if (!data.length) { g.fillStyle = "#5d6773"; g.fillText("데이터 대기 중", L + w / 2 - 40, T + h / 2); }
 }

@@ -515,6 +515,22 @@ def process(body, mode, thres, reset):
 
 # ---------------------------------------------------------------- server-side global view
 vis_cfg = {"world": True, "boost": True}   # --no-world-vis / --no-boost, or POST /v1/vis
+# What the Ouroboros phone predicts, chosen on the dashboard: "e2e" (network + GPU wait + compute)
+# or "compute" (server compute only: decode/registration/dirty map + ViT + post, no GPU wait).
+# Echoed in every /v1/infer response so the phone follows it on its next frame.
+pred_cfg = {"target": "e2e"}
+
+
+async def pred_config(request):
+    """GET: prediction target.  POST ?target=e2e|compute: change it live."""
+    if request.method == "POST":
+        t = request.query.get("target", "")
+        if t not in ("e2e", "compute"):
+            return web.json_response({"error": "target must be e2e or compute"}, status=400)
+        pred_cfg["target"] = t
+        print(f"[predict] target -> {t}", flush=True)
+        _broadcast("predcfg", dict(pred_cfg))
+    return web.json_response(dict(pred_cfg))
 
 
 class WorldView:
@@ -603,6 +619,7 @@ async def infer(request):
     resp["t_body"] = t_body          # ... when the full upload had arrived
     resp["t_send"] = time.time() * 1000
     resp["upload_bytes"] = len(body)
+    resp["pred_target"] = pred_cfg["target"]
     tmg = resp["timing"]
     print(f"[{mode:9s}] #{resp['idx']:5d} {len(body)/1024:5.1f}KB dirty={resp['n_dirty']:4d} "
           f"{'R' if resp['refresh'] else ' '} compute={tmg['compute']:6.1f} gpu={tmg['model']:5.1f} "
@@ -688,7 +705,7 @@ async def events(request):
     dash_clients.add(q)
     try:
         await resp.write(("event: snapshot\ndata: " + json.dumps(
-            {"history": list(dash_history), "now": time.time() * 1000, "vis": vis_cfg,
+            {"history": list(dash_history), "now": time.time() * 1000, "vis": vis_cfg, "pred": pred_cfg,
              "world_v": world_view.v}) + "\n\n").encode())
         while True:
             try:
@@ -781,7 +798,10 @@ def main():
                     help="do not render the Ouroboros anchor canvas in shared global coordinates")
     ap.add_argument("--no-boost", action="store_true",
                     help="server-side views: do not tint recomputed patches green")
+    ap.add_argument("--pred-target", default="e2e", choices=["e2e", "compute"],
+                    help="what the Ouroboros phone predicts (switchable live from the dashboard / POST /v1/predict)")
     args = ap.parse_args()
+    pred_cfg["target"] = args.pred_target
     vis_cfg.update(world=not args.no_world_vis, boost=not args.no_boost)
     device, gop, registration_mode = args.device, args.gop, args.registration
     gpu_sched.set_policy(args.sched)
@@ -808,6 +828,8 @@ def main():
     app.router.add_get("/v1/frame.jpg", frame_jpg)
     app.router.add_get("/v1/world.jpg", world_jpg)
     app.router.add_get("/v1/vis", vis_config)
+    app.router.add_get("/v1/predict", pred_config)
+    app.router.add_post("/v1/predict", pred_config)
     app.router.add_post("/v1/vis", vis_config)
     app.router.add_post("/v1/dashboard/reset", dash_reset)
     app.router.add_get("/v1/ports", ports_info)
