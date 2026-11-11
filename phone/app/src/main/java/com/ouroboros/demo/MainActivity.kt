@@ -74,6 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var checkPredict: CheckBox
     private lateinit var checkBoost: CheckBox
     private lateinit var checkWorld: CheckBox
+    private lateinit var checkAdapt: CheckBox
     private lateinit var editServer: EditText
     private lateinit var btnStart: Button
 
@@ -89,6 +90,17 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var thres = 20
     @Volatile private var predictOn = false
     @Volatile private var boostOn = true        // green-boost the patches the server recomputed
+    // Adaptive pacing: the server reports how long each request waited for the GPU (other phones' work).
+    // Integral controller on that wait: hold the *next capture* back by that much (target `ADAPT_MARGIN`),
+    // dropping the camera frames that arrive meanwhile, so the frame that is sent is fresh when it reaches
+    // the GPU instead of ageing in the queue.
+    @Volatile private var adaptOn = true
+    @Volatile private var adaptMargin = ADAPT_MARGIN   // `--ef adapt_margin <ms>`
+    @Volatile private var adaptGain = ADAPT_GAIN
+    @Volatile private var holdMs = 0.0          // current extra delay before the next capture
+    @Volatile private var nextSendAt = 0.0      // OffloadClient.nowMs() before which camera frames are dropped
+    private val droppedFrames = java.util.concurrent.atomic.AtomicInteger(0)
+    private var droppedTotal = 0
     @Volatile private var worldOn = false       // show the shared global (toroidal) canvas instead of the frame
     private val worldView by lazy { RecomputeVis.WorldView() }
     private val visExec = Executors.newSingleThreadExecutor()
@@ -129,7 +141,8 @@ class MainActivity : AppCompatActivity() {
         seekThres = findViewById(R.id.seekThres); txtThres = findViewById(R.id.txtThres)
         checkPredict = findViewById(R.id.checkPredict); editServer = findViewById(R.id.editServer)
         btnStart = findViewById(R.id.btnStart)
-        checkBoost = findViewById(R.id.checkBoost); checkWorld = findViewById(R.id.checkWorld)
+        checkBoost = findViewById(R.id.checkBoost); checkWorld = findViewById(R.id.checkWorld); checkAdapt = findViewById(R.id.checkAdapt)
+        checkAdapt.setOnCheckedChangeListener { _, on -> adaptOn = on; holdMs = 0.0; nextSendAt = 0.0 }
         checkBoost.setOnCheckedChangeListener { _, on -> boostOn = on }
         checkWorld.setOnCheckedChangeListener { _, on ->
             worldOn = on
@@ -171,6 +184,9 @@ class MainActivity : AppCompatActivity() {
         if (intent.hasExtra("thres")) seekThres.progress = intent.getIntExtra("thres", 20)
         if (intent.hasExtra("predict")) checkPredict.isChecked = intent.getBooleanExtra("predict", false)
         if (intent.hasExtra("boost")) checkBoost.isChecked = intent.getBooleanExtra("boost", true)
+        if (intent.hasExtra("adapt_margin")) adaptMargin = intent.getFloatExtra("adapt_margin", ADAPT_MARGIN.toFloat()).toDouble()
+        if (intent.hasExtra("adapt_gain")) adaptGain = intent.getFloatExtra("adapt_gain", ADAPT_GAIN.toFloat()).toDouble()
+        if (intent.hasExtra("adapt")) checkAdapt.isChecked = intent.getBooleanExtra("adapt", true)
         if (intent.hasExtra("world")) checkWorld.isChecked = intent.getBooleanExtra("world", false)
         if (intent.getBooleanExtra("autostart", false)) img.post { start() }
     }
@@ -280,7 +296,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onFrame(image: ImageProxy) {
-        if (!running.get() || !busy.compareAndSet(false, true)) { image.close(); return }
+        if (!running.get()) { image.close(); return }
+        // paced: the GPU is still busy with other phones' work, so this capture would only age in the queue
+        if (adaptOn && OffloadClient.nowMs() < nextSendAt) { droppedFrames.incrementAndGet(); image.close(); return }
+        if (!busy.compareAndSet(false, true)) { image.close(); return }
         val bmp = try { toUpright(image) } catch (e: Exception) { busy.set(false); image.close(); return }
         image.close()
         pipeExec.execute {
@@ -403,6 +422,11 @@ class MainActivity : AppCompatActivity() {
         val e2e = tDone - t0
         val clientPost = tDone - tPost0
         r.json.optInt("gop", 0).takeIf { it > 0 }?.let { mirror.gop = it }
+        if (adaptOn) {
+            val w = r.json.optJSONObject("timing")?.optDouble("gpu_wait", 0.0) ?: 0.0
+            holdMs = (holdMs + adaptGain * (w - adaptMargin)).coerceIn(0.0, ADAPT_MAX)
+            nextSendAt = OffloadClient.nowMs() + holdMs
+        }
         r.json.optString("pred_target", "").takeIf { it == "e2e" || it == "compute" }?.let { predTarget = it }
 
         val pend = try { fut?.get() } catch (e: Exception) { Log.e(TAG, "mirror failed", e); mirrorInSync = false; null }
@@ -495,6 +519,8 @@ class MainActivity : AppCompatActivity() {
             .put("n_dirty", r.nDirty).put("refresh", r.refresh).put("refresh_reason", r.json.opt("refresh_reason"))
             .put("thres", th).put("kb", kb))
         rec.put("predict_on", m == Mode.OUROBOROS && predictOn)
+        val dropped = droppedFrames.getAndSet(0); droppedTotal += dropped
+        rec.put("adapt", J().put("on", adaptOn).put("hold", holdMs).put("dropped", dropped).put("dropped_total", droppedTotal))
         rec.put("boost", info != null && boostOn).put("world_view", showWorld)
         if (pend != null) {
             val wi = JSONArray(); pend.whatIfEst.forEachIndexed { i, (wt, n, ms) ->
@@ -541,7 +567,8 @@ class MainActivity : AppCompatActivity() {
         if (doneTimes.size < 2) Double.NaN else 1000.0 * (doneTimes.size - 1) / (doneTimes.last() - doneTimes.first())
 
     private fun commonStats() = "frame #%d | e2e last %.0f ms, avg(30) %.0f ms | %.2f FPS\n".format(
-        frameNo, e2eHist.last(), e2eHist.average(), fps())
+        frameNo, e2eHist.last(), e2eHist.average(), fps()) +
+        (if (adaptOn && mode != Mode.ON_DEVICE) "촬영 지연 %.0f ms | 버린 프레임 %d\n".format(holdMs, droppedTotal) else "")
 
     private fun setStatus(e2e: Double) {
         txtStatus.text = "%s  #%d  %.0f ms  ·  %.2f FPS".format(mode.label, frameNo, e2e, fps())
@@ -576,6 +603,9 @@ class MainActivity : AppCompatActivity() {
     private fun ui(block: () -> Unit) = runOnUiThread(block)
 
     companion object {
+        private const val ADAPT_MARGIN = 40.0   // ms of GPU wait kept on purpose so the GPU never idles
+        private const val ADAPT_GAIN = 0.5      // integral gain; < 1 so two phones adapting at once don't oscillate
+        private const val ADAPT_MAX = 300.0
         const val TAG = "OuroDemo"
         const val MODEL_NAME = "vitdet_b.onnx"
     }

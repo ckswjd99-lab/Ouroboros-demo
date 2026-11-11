@@ -109,6 +109,19 @@ Three at once (Pixel = Ouroboros+prediction, sim naive with --net-ms 15, sim on-
 - Pixel alone on MIG, 100 frames: compute MAE 2.5 ms, bias +0.1, 94% within ±10%, 99% within ±20%
   (e2e on the same run: MAE 11.8 ms, 67% / 94%).
 
+## Adaptive frame pacing (2026-11-11)
+- Problem: with several phones on one GPU a frame is captured, then ages in the GPU queue (`timing.gpu_wait`).
+- App: checkbox "프레임 속도 자동 조절" (default ON; `--ez adapt false`). Integral controller on the server-reported
+  `gpu_wait`: `hold += 0.5*(gpu_wait - 40 ms)` (0..300 ms); the next capture is held back by `hold` and camera frames that
+  arrive meanwhile are dropped, so the frame sent is the freshest at the moment it reaches the GPU. Needs no probe and
+  works in Naive and Ouroboros alike; tunable with `--ef adapt_margin` / `adapt_gain`. Report field `adapt` {hold, dropped}.
+- Measured, two Pixels at once (Ouroboros + Naive) on the MIG, **saturated worst case** (dark scene -> Ouroboros
+  reg_fail on 148/155 frames, so both phones fully recompute), 30 s per setting, single runs:
+  off 311/310 ms e2e, 3.1/3.2 FPS; margin 15 -> 296/248 ms but 2.5 FPS; margin 40 -> 317/270 ms, 3.0 FPS;
+  margin 80 gain .3 ~ same as off. gpu_wait falls (naive 74 -> 13-45 ms) but a saturated GPU cannot be made faster:
+  pacing only trades some FPS for latency, and a margin below the upload jitter (sigma ~25 ms) lets the GPU idle.
+  Not yet measured: a feature-rich scene (Ouroboros light), where the saving should be larger.
+
 ## Visualisation options (2026-11-10)
 - **Recomputed-patch green boost** (default ON; upstream's `img[...,1] = clip(img[...,1] + dmap*30, 0, 255)`).
   Drawn on the camera frame: each frame pixel looks its patch up through the server's affine

@@ -58,6 +58,11 @@
                 android:text="global 좌표 보기" />
         </LinearLayout>
 
+        <CheckBox android:id="@+id/checkAdapt"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#FFFFFF" android:checked="true"
+            android:text="프레임 속도 자동 조절 (서버 GPU 대기만큼 촬영을 늦추고 그동안의 프레임은 버림)" />
+
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal">
             <EditText android:id="@+id/editServer" android:layout_width="0dp" android:layout_weight="1"
